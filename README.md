@@ -168,7 +168,7 @@ The `output_path` template follows [yt-dlp output template](https://github.com/y
 | `done_dir` | String | `/app/Done/` | Directory for finished standard downloads. |
 | `members_dir` | String | `/app/Done/` | Directory for finished members-only downloads. |
 | `unarchived_dir` | String | `/app/Done/` | Directory for finished unarchived downloads. |
-| `cookies_file` | String | `/app/cookies.txt` | Path to cookies file (Required for Members/Age-gated). |
+| `cookies_file` | String | *None* | Path to cookies file (Required for Members/Age-gated). |
 | **Quality & Fetching** |  |  |  |
 | `video_quality` | String | `bv+ba/best` | Target resolution. Uses [yt-dlp's format selector](https://github.com/yt-dlp/yt-dlp#format-selection) or an alias (`audio_only`, `144p`, `240p`, `360p`, `480p`, `720p`, `720p60`, `1080p`, `1080p60`, `1440p`, `1440p60`, `2160p`, `2160p60`, `best`). |
 | `download_threads` | Int | `4` | Threads used by livestream_dl for downloading. |
