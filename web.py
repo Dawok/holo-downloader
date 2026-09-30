@@ -4,7 +4,6 @@ import threading
 import time
 import sqlite3
 import random
-import sys
 import secrets
 import hmac
 import shutil
@@ -341,9 +340,8 @@ def thread_worker(video_id, downloader, thread_tracker: dict = active_downloads)
 
             history_update_event.set()
             
-    except Exception as e:
-        common.logger.error(f"Error downloading {video_id}: {e}", file=sys.stderr)
-        e = None
+    except Exception:
+        common.logger.exception("Error downloading %s", video_id)
     finally:
         with LOCK:
             entry = thread_tracker.get(video_id)

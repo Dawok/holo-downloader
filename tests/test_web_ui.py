@@ -294,6 +294,58 @@ class WebUiTests(unittest.TestCase):
         self.assertIn(b'Fallback title', self.client.get('/data/history').data)
         self.assertNotIn('abcdefghijk', self.web.active_downloads)
 
+    def test_worker_failure_still_removes_temporary_files_and_clears_the_job(self):
+        temp_root = self.path.parent / 'temp'
+        stream_folder = temp_root / 'Example (abcdefghijk)'
+        stream_folder.mkdir(parents=True)
+        (stream_folder / 'video.mp4.temp').write_bytes(b'partial')
+        downloader = SimpleNamespace(
+            config=SimpleNamespace(get_temp_folder=lambda: str(temp_root)),
+            temp_output_dir=str(stream_folder),
+            livestream_downloader=SimpleNamespace(file_names={}),
+            main=Mock(side_effect=RuntimeError('Download failed')),
+        )
+        self.web.active_downloads['abcdefghijk'] = {'downloader': downloader, 'remove_requested': True}
+        with self.assertLogs(self.web.common.logger, level='ERROR') as logs:
+            self.web.thread_worker('abcdefghijk', downloader)
+        self.assertIn('Download failed', logs.output[0])
+        self.assertFalse(stream_folder.exists())
+        self.assertNotIn('abcdefghijk', self.web.active_downloads)
+        self.assertFalse(self.web.get_history())
+
+    def test_remove_still_cancels_when_blacklist_storage_is_unavailable(self):
+        downloader = SimpleNamespace(kill_this=threading.Event())
+        self.web.active_downloads['abcdefghijk'] = {'downloader': downloader}
+        with patch.object(self.web, 'suppress_stream', side_effect=sqlite3.OperationalError('database locked')), \
+                self.assertLogs(self.web.common.logger, level='ERROR'):
+            self.assertEqual(self.post('/actions/cancel/abcdefghijk').status_code, 302)
+        self.assertTrue(downloader.kill_this.is_set())
+        self.assertTrue(self.web.active_downloads['abcdefghijk']['remove_requested'])
+        self.assertEqual(self.client.get('/api/active').json, [])
+        with self.client.session_transaction() as session:
+            self.assertTrue(any(category == 'warning' and 'could not be saved' in message
+                                for category, message in session['_flashes']))
+
+    def test_cleanup_preserves_files_outside_the_temporary_root(self):
+        temp_root = self.path.parent / 'temp'
+        temp_root.mkdir()
+        archive = self.path.parent / 'Done' / 'Example (abcdefghijk)'
+        archive.mkdir(parents=True)
+        final_file = archive / 'video.mp4'
+        final_file.write_bytes(b'archived')
+        (temp_root / 'linked-archive').symlink_to(archive, target_is_directory=True)
+        downloader = SimpleNamespace(
+            config=SimpleNamespace(get_temp_folder=lambda: str(temp_root)),
+            temp_output_dir=str(archive),
+            livestream_downloader=SimpleNamespace(file_names={
+                'merged': final_file, 'thumbnail': temp_root / 'linked-archive' / 'video.mp4',
+            }),
+        )
+        with self.assertLogs(self.web.common.logger, level='ERROR'):
+            self.web.remove_download_temp_files('abcdefghijk', downloader)
+        self.assertEqual(final_file.read_bytes(), b'archived')
+        self.assertTrue((temp_root / 'linked-archive').is_symlink())
+
     def test_finished_jobs_keep_the_archived_thumbnail_with_history(self):
         for download_type in ('stream', 'unarchived'):
             with self.subTest(download_type=download_type):

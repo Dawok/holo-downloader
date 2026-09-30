@@ -6,7 +6,8 @@ from getConfig import ConfigHandler
 from pathlib import Path
 
 import discord_web
-from time import sleep, asctime, monotonic
+from time import sleep, asctime, time
+from random import uniform
 # Import FileLock, setup_umask, AND the shared kill_all event from common
 from common import FileLock, setup_umask, kill_all, initialize_logging
 
@@ -143,7 +144,6 @@ class VideoDownloader():
         
         
         max_wait = max(float(self.config.upcoming_video_max_wait()), 60)
-        wait_started = monotonic()
         while True:
             if self.kill_this.is_set():
                 raise InterruptedError("Download was removed")
@@ -161,6 +161,8 @@ class VideoDownloader():
                 ignore_no_formats=True,
                 logger=self.logger,
             )
+            if self.kill_this.is_set():
+                raise InterruptedError("Download was removed")
             self.info_dict = {
                 'id': info_dict.get('id'),
                 'title': info_dict.get('title'),
@@ -171,10 +173,10 @@ class VideoDownloader():
             }
             if live_status != "is_upcoming":
                 break
-            remaining = max_wait - (monotonic() - wait_started)
-            if remaining <= 0:
-                break
-            if self.kill_this.wait(min(60, remaining)):
+            release_timestamp = info_dict.get("release_timestamp")
+            wait_seconds = (release_timestamp - time() if release_timestamp is not None
+                            else uniform(60, max_wait))
+            if self.kill_this.wait(min(max(wait_seconds, 60), max_wait)):
                 raise InterruptedError("Download was removed")
 
         with yt_dlp.YoutubeDL(options) as ydl:
