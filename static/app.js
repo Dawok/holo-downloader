@@ -17,13 +17,6 @@ function updateScheduledTimes(root = document) {
     }
 }
 
-function setDetailsExpanded(button, detail, expanded) {
-    detail.hidden = !expanded;
-    button.setAttribute('aria-expanded', String(expanded));
-    button.setAttribute('aria-label', `${expanded ? 'Hide' : 'Show'} details for ${button.dataset.detailsLabel}`);
-    button.title = `${expanded ? 'Hide' : 'Show'} details`;
-}
-
 document.addEventListener('error', event => {
     if (event.target instanceof HTMLImageElement && event.target.hasAttribute('data-history-thumbnail')) {
         event.target.hidden = true;
@@ -88,15 +81,10 @@ for (const container of document.querySelectorAll('[data-poll]')) {
             });
             if (!response.ok) throw new Error('Update unavailable');
             const html = await response.text();
-            const openDetails = new Set(Array.from(container.querySelectorAll('[data-job]:not([hidden])'), detail => detail.dataset.job));
             if (!isBusy()) {
                 container.innerHTML = html;
                 hideBrokenHistoryThumbnails(container);
                 updateScheduledTimes(container);
-                for (const detail of container.querySelectorAll('[data-job]')) {
-                    const toggle = container.querySelector(`[data-toggle-details="${detail.dataset.job}"]`);
-                    if (toggle) setDetailsExpanded(toggle, detail, openDetails.has(detail.dataset.job));
-                }
             }
             updateCounters(container);
             const scope = container.closest('.filter-scope');
@@ -114,11 +102,6 @@ for (const container of document.querySelectorAll('[data-poll]')) {
 }
 
 document.addEventListener('click', event => {
-    const toggle = event.target.closest('[data-toggle-details]');
-    if (toggle) {
-        const detail = document.getElementById(toggle.dataset.toggleDetails);
-        setDetailsExpanded(toggle, detail, detail.hidden);
-    }
     const closer = event.target.closest('[data-close-dialog]');
     if (closer) closer.closest('dialog').close();
     const dismiss = event.target.closest('[data-dismiss]');

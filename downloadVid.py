@@ -171,7 +171,9 @@ class VideoDownloader():
                 'fulltitle': info_dict.get('fulltitle'),
                 'uploader': info_dict.get('uploader'),
                 'thumbnail': info_dict.get('thumbnail'),
-                'webpage_url': info_dict.get('webpage_url')
+                'webpage_url': info_dict.get('webpage_url'),
+                'release_timestamp': info_dict.get('release_timestamp'),
+                'live_status': info_dict.get('live_status')
             }
             if live_status != "is_upcoming":
                 break
