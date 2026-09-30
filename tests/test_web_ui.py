@@ -193,7 +193,7 @@ class WebUiTests(unittest.TestCase):
             self.assertEqual(self.web.get_history()[0]['title'], 'Recorded title')
             self.assertEqual(self.client.get('/data/history').status_code, 200)
 
-    def test_recording_rows_escape_titles_and_stop_sets_event(self):
+    def test_recording_rows_escape_titles_and_remove_hides_stream(self):
         downloader = SimpleNamespace(info_dict={'title': '<script>alert(1)</script>', 'channel': 'Example channel'}, embed_info={},
                                      livestream_downloader=SimpleNamespace(stats={'status': 'Recording', 'video': {'current_filesize': 1024}}),
                                      kill_this=threading.Event())
@@ -207,8 +207,11 @@ class WebUiTests(unittest.TestCase):
         self.assertIn('start_timestamp', self.client.get('/api/active').json[0])
         self.assertEqual(self.post('/actions/cancel/abcdefghijk').status_code, 302)
         self.assertTrue(downloader.kill_this.is_set())
+        self.assertTrue(self.web.active_downloads['abcdefghijk']['remove_requested'])
+        self.assertTrue(self.web.is_stream_removed('abcdefghijk'))
+        self.assertEqual(self.client.get('/api/active').json, [])
 
-    def test_waiting_streams_have_a_separate_tab_and_no_timer(self):
+    def test_waiting_streams_share_the_stream_list_without_a_timer(self):
         downloader = SimpleNamespace(info_dict={'title': 'Upcoming stream', 'channel': 'Example channel'}, embed_info={},
                                      livestream_downloader=SimpleNamespace(stats={'status': 'Waiting', 'video': {}, 'audio': {}}),
                                      kill_this=threading.Event())
@@ -225,18 +228,62 @@ class WebUiTests(unittest.TestCase):
         self.assertIsNone(waiting_job['elapsed'])
 
         response = self.client.get('/data/active')
-        self.assertIn(b'Waiting <span class="recording-tab-count">1</span>', response.data)
-        waiting_panel = response.data.split(b'id="waiting-panel"', 1)[1]
-        self.assertIn(b'Upcoming stream', waiting_panel)
-        self.assertIn(b'Waiting for stream', waiting_panel)
-        self.assertNotIn(b'data-started=', waiting_panel)
-        self.assertNotIn(b'running time', waiting_panel)
+        self.assertIn(b'Upcoming stream', response.data)
+        self.assertIn(b'Waiting for stream', response.data)
+        self.assertNotIn(b'data-recording-tab', response.data)
+        self.assertNotIn(b'data-started=', response.data)
+        self.assertNotIn(b'running time', response.data)
 
         downloader.livestream_downloader.stats['status'] = 'Recording'
         recording_job = self.client.get('/api/active').json[0]
         self.assertFalse(recording_job['is_waiting'])
         self.assertIsNotNone(recording_job['start_timestamp'])
         self.assertEqual(recording_job['elapsed'], '00:00:00')
+
+    def test_remove_cleans_only_stream_temp_files_and_allows_readding(self):
+        temp_root = self.path.parent / 'temp'
+        stream_folder = temp_root / 'Example channel' / 'Upcoming (abcdefghijk)'
+        stream_folder.mkdir(parents=True)
+        temp_file = stream_folder / 'video.mp4.temp'
+        temp_file.write_bytes(b'partial')
+        other_stream_file = temp_root / 'Example channel' / 'Other (bcdefghijkl)' / 'video.mp4.temp'
+        other_stream_file.parent.mkdir(parents=True)
+        other_stream_file.write_bytes(b'other partial')
+        final_file = self.path.parent / 'Done' / 'video.mp4'
+        final_file.parent.mkdir()
+        final_file.write_bytes(b'archived')
+        replacement = SimpleNamespace()
+        downloader = SimpleNamespace(
+            info_dict={},
+            embed_info={},
+            config=SimpleNamespace(get_temp_folder=lambda: str(temp_root)),
+            temp_output_dir=str(stream_folder),
+            livestream_downloader=SimpleNamespace(stats={'status': 'Cancelled'}, file_names={'databases': []}),
+            main=Mock(),
+        )
+        self.web.active_downloads['abcdefghijk'] = {
+            'downloader': downloader,
+            'type': 'stream',
+            'remove_requested': True,
+        }
+
+        self.web.thread_worker('abcdefghijk', downloader)
+
+        self.assertFalse(stream_folder.exists())
+        self.assertTrue(other_stream_file.exists())
+        self.assertTrue(final_file.exists())
+        self.assertFalse(self.web.get_history())
+        self.assertNotIn('abcdefghijk', self.web.active_downloads)
+        self.web.suppress_stream('abcdefghijk')
+        self.web.init_db()
+        self.assertTrue(self.web.is_stream_removed('abcdefghijk'))
+        self.assertFalse(self.web.start_unarchived_download('abcdefghijk'))
+        with patch.object(self.web.downloadVid, 'VideoDownloader', return_value=replacement, create=True), \
+                patch.object(self.web.threading, 'Thread', return_value=Mock()):
+            self.assertFalse(self.web.start_download('abcdefghijk'))
+            self.assertTrue(self.web.start_download('abcdefghijk', manual=True))
+        self.assertIs(self.web.active_downloads['abcdefghijk']['downloader'], replacement)
+        self.assertFalse(self.web.is_stream_removed('abcdefghijk'))
 
     def test_finished_job_stores_embed_fallback_and_refreshes_history(self):
         self.client.get('/data/history')
@@ -352,7 +399,7 @@ class WebUiTests(unittest.TestCase):
             self.assertEqual(self.post('/actions/add', video_id='invalid').status_code, 302)
             start.assert_not_called()
             self.assertEqual(self.post('/actions/add', video_id='https://youtu.be/abcdefghijk').status_code, 302)
-            start.assert_called_once_with('abcdefghijk')
+            start.assert_called_once_with('abcdefghijk', manual=True)
 
 
 if __name__ == '__main__':

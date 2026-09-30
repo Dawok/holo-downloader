@@ -6,7 +6,7 @@ from getConfig import ConfigHandler
 from pathlib import Path
 
 import discord_web
-from time import sleep, asctime
+from time import sleep, asctime, monotonic
 # Import FileLock, setup_umask, AND the shared kill_all event from common
 from common import FileLock, setup_umask, kill_all, initialize_logging
 
@@ -62,6 +62,7 @@ class VideoDownloader():
 
         self.info_dict = {}
         self.outputFile = None
+        self.temp_output_dir = None
 
         try:
             response = httpx.get("https://www.youtube.com/oembed?format=json&url=https://www.youtube.com/watch?v={0}".format(self.id), timeout=30)
@@ -101,7 +102,10 @@ class VideoDownloader():
         
         try:            
             self.livestream_downloader.stats["status"] = "Recording"
-            self.livestream_downloader.download_segments(info_dict=info_dict, resolution=options.get("resolution"), options=options)
+            try:
+                self.livestream_downloader.download_segments(info_dict=info_dict, resolution=options.get("resolution"), options=options)
+            finally:
+                self.temp_output_dir = options.get("temp_folder")
             
             if self.kill_this.is_set():
                 self.livestream_downloader.stats["status"] = "Cancelled"
@@ -138,22 +142,42 @@ class VideoDownloader():
         
         
         
-        with yt_dlp.YoutubeDL(options) as ydl:
-            additional_ytdlp_options = None
-            if self.config.get_ytdlp_options():
-                additional_ytdlp_options = json.loads(self.config.get_ytdlp_options())
-                
-            # Call get_Video_Info with config dependencies
+        max_wait = max(float(self.config.upcoming_video_max_wait()), 60)
+        wait_started = monotonic()
+        while True:
+            if self.kill_this.is_set():
+                raise InterruptedError("Download was removed")
+            additional_ytdlp_options = json.loads(self.config.get_ytdlp_options() or "{}")
+            additional_ytdlp_options.setdefault("socket_timeout", 30)
             info_dict, live_status = getUrls.get_Video_Info(
-                id=video_url, 
-                wait=(60, max(self.config.upcoming_video_max_wait(), 60)), 
-                cookies=self.config.get_cookies_file(), 
-                proxy=self.config.get_proxy(), 
-                additional_options=additional_ytdlp_options, 
-                include_dash=self.config.get_include_dash(), 
+                id=video_url,
+                wait=False,
+                cookies=self.config.get_cookies_file(),
+                proxy=self.config.get_proxy(),
+                additional_options=additional_ytdlp_options,
+                include_dash=self.config.get_include_dash(),
                 include_m3u8=self.config.get_include_m3u8(),
                 clean_info_dict=self.config.get_clean_info_json(),
+                ignore_no_formats=True,
+                logger=self.logger,
             )
+            self.info_dict = {
+                'id': info_dict.get('id'),
+                'title': info_dict.get('title'),
+                'fulltitle': info_dict.get('fulltitle'),
+                'uploader': info_dict.get('uploader'),
+                'thumbnail': info_dict.get('thumbnail'),
+                'webpage_url': info_dict.get('webpage_url')
+            }
+            if live_status != "is_upcoming":
+                break
+            remaining = max_wait - (monotonic() - wait_started)
+            if remaining <= 0:
+                break
+            if self.kill_this.wait(min(60, remaining)):
+                raise InterruptedError("Download was removed")
+
+        with yt_dlp.YoutubeDL(options) as ydl:
             outputFile = str(ydl.prepare_filename(info_dict)).replace("%", "％")
                 
         self.logger.debug("({0}) Info.json: {1}".format(video_url, json.dumps(info_dict)))
@@ -192,6 +216,10 @@ class VideoDownloader():
                 self.downloader(info_dict)
                 
             except Exception as e:
+                if self.kill_this.is_set():
+                    self.livestream_downloader.stats["status"] = "Cancelled"
+                    self.logger.info("Download of %s was removed", self.id)
+                    return
                 self.logger.exception("Error downloading video")
                 # Pass config for error notification
                 discord_web.main(self.id, "error", message=f"{type(e).__name__}: {str(e)}"[-500:], config=self.config)

@@ -95,12 +95,6 @@ textarea { resize: vertical; line-height: 1.5; }
 .panel { min-width: 0; margin-top: 30px; }
 .panel-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
 .panel-heading .text-link { font-size: 13px; }
-.recording-tabs { margin-top: 10px; }
-.recording-tab-list { display: flex; gap: 4px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
-.recording-tab { display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--muted); font-weight: 550; cursor: pointer; }
-.recording-tab:hover { background: var(--raised); color: var(--text); }
-.recording-tab[aria-pressed='true'] { background: var(--raised); border-color: var(--border); color: var(--text); }
-.recording-tab-count { min-width: 1.5em; border-radius: 999px; padding: 1px 5px; background: var(--surface); color: var(--subtle); font: 12px/1.3 var(--mono); text-align: center; }
 .stream-waiting { color: var(--subtle); font-size: 13px; }
 .stream-list { border-bottom: 1px solid var(--border); }
 .stream-list:has(.empty-state) { border: 0; }
@@ -127,6 +121,8 @@ textarea { resize: vertical; line-height: 1.5; }
 .stream-size strong { display: block; font-weight: 600; font-size: 15px; margin-bottom: 4px; }
 .stream-controls { grid-area: controls; display: flex; flex-direction: column; gap: 6px; }
 .stream-controls .button { width: 100%; }
+.stream-controls form { display: flex; justify-content: flex-end; }
+.stream-controls form .button { width: 34px; }
 .stream-details { grid-area: details; padding: 12px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--muted); font: 12px/1.55 var(--mono); }
 .stream-details dl { margin: 0; display: flex; flex-wrap: wrap; gap: 12px 34px; }
 .stream-details dd { margin: 0; color: var(--text); }

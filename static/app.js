@@ -46,18 +46,6 @@ function updateCounters(container) {
     }
 }
 
-function selectRecordingTab(container, selected) {
-    const tabs = container.matches('[data-recording-tabs]') ? container : container.querySelector('[data-recording-tabs]');
-    if (!tabs) return;
-    tabs.dataset.selectedTab = selected;
-    for (const button of tabs.querySelectorAll('[data-recording-tab]')) {
-        const active = button.dataset.recordingTab === selected;
-        button.setAttribute('aria-pressed', String(active));
-        const panel = tabs.querySelector(`[data-recording-panel="${button.dataset.recordingTab}"]`);
-        if (panel) panel.hidden = !active;
-    }
-}
-
 let pendingConfirmation;
 
 for (const container of document.querySelectorAll('[data-poll]')) {
@@ -81,12 +69,10 @@ for (const container of document.querySelectorAll('[data-poll]')) {
             });
             if (!response.ok) throw new Error('Update unavailable');
             const html = await response.text();
-            const selectedTab = container.querySelector('[data-recording-tabs]')?.dataset.selectedTab;
             const openDetails = new Set(Array.from(container.querySelectorAll('[data-job]:not([hidden])'), detail => detail.dataset.job));
             if (!isBusy()) {
                 container.innerHTML = html;
                 hideBrokenHistoryThumbnails(container);
-                if (selectedTab) selectRecordingTab(container, selectedTab);
                 for (const detail of container.querySelectorAll('[data-job]')) {
                     detail.hidden = !openDetails.has(detail.dataset.job);
                     container.querySelector(`[data-toggle-details="${detail.dataset.job}"]`).setAttribute('aria-expanded', String(!detail.hidden));
@@ -108,8 +94,6 @@ for (const container of document.querySelectorAll('[data-poll]')) {
 }
 
 document.addEventListener('click', event => {
-    const recordingTab = event.target.closest('[data-recording-tab]');
-    if (recordingTab) selectRecordingTab(recordingTab.closest('[data-recording-tabs]'), recordingTab.dataset.recordingTab);
     const toggle = event.target.closest('[data-toggle-details]');
     if (toggle) {
         const detail = document.getElementById(toggle.dataset.toggleDetails);

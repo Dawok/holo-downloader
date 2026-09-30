@@ -7,6 +7,7 @@ import random
 import sys
 import secrets
 import hmac
+import shutil
 from contextlib import closing
 from datetime import datetime
 from io import BytesIO
@@ -124,6 +125,24 @@ def init_db():
                                     ('thumbnail', 'BLOB'), ('thumbnail_mime_type', 'TEXT')):
             if column not in columns:
                 conn.execute(f'ALTER TABLE history ADD COLUMN {column} {column_type}')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS removed_streams (
+                video_id TEXT PRIMARY KEY,
+                removed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+def is_stream_removed(video_id):
+    with closing(sqlite3.connect(DB_FILE)) as conn:
+        return conn.execute('SELECT 1 FROM removed_streams WHERE video_id = ?', (video_id,)).fetchone() is not None
+
+def suppress_stream(video_id):
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
+        conn.execute('INSERT OR IGNORE INTO removed_streams (video_id) VALUES (?)', (video_id,))
+
+def allow_stream(video_id):
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
+        conn.execute('DELETE FROM removed_streams WHERE video_id = ?', (video_id,))
 
 def save_to_history(video_id, stats, download_type="Unknown", info=None, thumbnail_path=None):
     """Saves finished stream to DB and ensures only last 50 exist."""
@@ -220,37 +239,131 @@ def get_download_thumbnail(downloader):
             continue
     return None
 
+def _iter_paths(value):
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from _iter_paths(child)
+    elif isinstance(value, (list, tuple, set)):
+        for child in value:
+            yield from _iter_paths(child)
+    elif isinstance(value, (str, os.PathLike)):
+        yield Path(value)
+
+def _temp_cleanup_root(config):
+    configured = Path(config.get_temp_folder()).expanduser()
+    parts = configured.parts
+    template_index = next((index for index, part in enumerate(parts) if "%(" in part), None)
+    root = Path(*parts[:template_index]) if template_index is not None else configured
+    return root.resolve()
+
+def remove_download_temp_files(video_id, downloader):
+    try:
+        root = _temp_cleanup_root(downloader.config)
+    except Exception:
+        common.logger.exception("Could not resolve temporary folder for %s", video_id)
+        return
+
+    temp_output_dir = getattr(downloader, 'temp_output_dir', None)
+    candidate = Path(temp_output_dir).expanduser() if temp_output_dir else None
+    candidate_root = None
+    removed_folder_parent = None
+    try:
+        if candidate is not None and not candidate.is_symlink():
+            candidate = candidate.resolve()
+            relative_parts = candidate.relative_to(root).parts
+            if candidate != root:
+                candidate_root = candidate
+                if candidate.is_dir() and any(video_id in part for part in relative_parts):
+                    shutil.rmtree(candidate)
+                    removed_folder_parent = candidate.parent
+    except (OSError, ValueError):
+        common.logger.exception("Could not remove temporary folder for %s", video_id)
+        candidate_root = None
+
+    if removed_folder_parent is not None:
+        parent = removed_folder_parent
+        try:
+            while parent != root:
+                parent.relative_to(root)
+                parent.rmdir()
+                parent = parent.parent
+        except (OSError, ValueError):
+            pass
+
+    file_names = getattr(getattr(downloader, 'livestream_downloader', None), 'file_names', {})
+    paths = list(_iter_paths(file_names))
+    for path in paths:
+        try:
+            resolved = path.resolve()
+            relative_parts = resolved.relative_to(root).parts
+            if candidate_root is not None:
+                resolved.relative_to(candidate_root)
+            elif not any(video_id in part for part in relative_parts):
+                continue
+            if path.is_file() or path.is_symlink():
+                path.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            continue
+
+    for path in paths:
+        try:
+            parent = path.resolve().parent
+            while parent != root:
+                parent.relative_to(root)
+                parent.rmdir()
+                parent = parent.parent
+        except (OSError, ValueError):
+            continue
+
 # --- Core Logic & Threading ---
 
 def thread_worker(video_id, downloader, thread_tracker: dict = active_downloads):
     global recently_finished
+    remove_requested = False
     try:
         downloader.main()
-        save_to_history(video_id, downloader.livestream_downloader.stats,
-                        download_type=thread_tracker.get(video_id, {}).get("type", "Unknown"),
-                        info=get_download_metadata(downloader),
-                        thumbnail_path=get_download_thumbnail(downloader))
-        
-        with app.app_context():
-            cache.delete('history-fragment')
-        
-        history_update_event.set()
+        with LOCK:
+            entry = thread_tracker.get(video_id)
+            owns_entry = entry is not None and entry.get('downloader') is downloader
+            remove_requested = owns_entry and entry.get('remove_requested', False)
+            download_type = entry.get('type', 'Unknown') if owns_entry else 'Unknown'
+            if owns_entry:
+                entry['worker_finished'] = True
+
+        if not remove_requested:
+            save_to_history(video_id, downloader.livestream_downloader.stats,
+                            download_type=download_type,
+                            info=get_download_metadata(downloader),
+                            thumbnail_path=get_download_thumbnail(downloader))
+
+            with app.app_context():
+                cache.delete('history-fragment')
+
+            history_update_event.set()
             
     except Exception as e:
         common.logger.error(f"Error downloading {video_id}: {e}", file=sys.stderr)
         e = None
     finally:
         with LOCK:
-            # Explicitly clear the downloader reference BEFORE popping
-            if video_id in thread_tracker:
-                thread_tracker[video_id]['downloader'] = None # Help GC
-                thread_tracker[video_id]['thread'] = None     # Help GC
+            entry = thread_tracker.get(video_id)
+            owns_entry = entry is not None and entry.get('downloader') is downloader
+            remove_requested = owns_entry and entry.get('remove_requested', False)
+            if owns_entry:
+                entry['worker_finished'] = True
+
+        if remove_requested:
+            remove_download_temp_files(video_id, downloader)
+
+        with LOCK:
+            entry = thread_tracker.get(video_id)
+            if entry is not None and entry.get('downloader') is downloader:
                 thread_tracker.pop(video_id, None)
         
         # REMOVED: gc.collect() 
         # (Let Python manage this. Only run manual GC on a schedule if absolutely necessary)
 
-def start_download(video_id):
+def start_download(video_id, manual=False):
     if isinstance(video_id, dict):
         id = video_id.get('id', None) or video_id.get('video_id', None) # added option in case additional fields are included in future
     else:
@@ -258,6 +371,11 @@ def start_download(video_id):
     with LOCK:
         if id in active_downloads:
             return False 
+        if manual:
+            allow_stream(id)
+        elif is_stream_removed(id):
+            common.logger.info("Skipping manually removed stream %s", id)
+            return False
 
         downloader = downloadVid.VideoDownloader(id=video_id, config=load_config())
         thread = threading.Thread(target=thread_worker, args=(id, downloader, active_downloads), daemon=True)
@@ -275,7 +393,7 @@ def start_download(video_id):
     
 def start_unarchived_download(video_id):
     with LOCK:
-        if video_id in active_unarchived_downloads:
+        if video_id in active_unarchived_downloads or is_stream_removed(video_id):
             return False 
 
         downloader = unarchived.UnarchivedDownloader(id=video_id, config=load_config())
@@ -414,6 +532,8 @@ def get_active_jobs_data():
     with LOCK:
         current_jobs = []
         for vid, job in active_downloads.copy().items():
+            if job.get('remove_requested'):
+                continue
             downloader: downloadVid.VideoDownloader = job['downloader']
             display_info = get_download_metadata(downloader)
             stats = downloader.livestream_downloader.stats
@@ -613,10 +733,15 @@ def manual_add():
         if not video_id:
             flash('Enter a valid YouTube video link or 11-character video ID.', 'danger')
             return redirect(url_for('index'))
-        if start_download(video_id):
+        if start_download(video_id, manual=True):
             flash(f"Started download for {video_id}", "success")
         else:
-            flash(f"Video {video_id} is already being downloaded.", "warning")
+            with LOCK:
+                removing = active_downloads.get(video_id, {}).get('remove_requested', False)
+            if removing:
+                flash(f"Video {video_id} is being removed. Try adding it again after cleanup finishes.", "warning")
+            else:
+                flash(f"Video {video_id} is already being downloaded.", "warning")
     return redirect(url_for('index'))
 
 @app.route('/config', methods=['GET', 'POST'])
@@ -752,19 +877,29 @@ def schedules_page():
 
 @app.route('/actions/cancel/<video_id>', methods=['POST'])
 def cancel_download(video_id):
-    """Sets the kill flag to True for a specific downloader."""
     with LOCK:
         if video_id in active_downloads:
             job_entry = active_downloads[video_id]
             downloader_instance: downloadVid.VideoDownloader = job_entry.get('downloader')
-            
-            # Navigate to the inner downloader object that holds the flag
-            # Based on your existing code: downloader -> livestream_downloader
+            if job_entry.get('worker_finished'):
+                flash(f"Stream {video_id} has already finished.", "secondary")
+                return redirect(url_for('index'))
+            suppression_saved = True
+            try:
+                suppress_stream(video_id)
+            except sqlite3.Error as e:
+                suppression_saved = False
+                common.logger.error("Could not suppress removed stream %s: %s", video_id, e)
             try:
                 downloader_instance.kill_this.set()
+                job_entry['remove_requested'] = True
+                if suppression_saved:
+                    flash(f"Removing stream {video_id} and its temporary files. It will stay skipped until you add it manually.", "success")
+                else:
+                    flash(f"Removing stream {video_id}, but its scheduled-scan exclusion could not be saved.", "warning")
             except Exception as e:
                 common.logger.error(f"Failed to cancel {video_id}: {e}")
-                flash(f"Error cancelling {video_id}", "danger")
+                flash(f"Could not remove {video_id}.", "danger")
                 e = None
         else:
             flash(f"Stream {video_id} is not currently active.", "secondary")
