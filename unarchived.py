@@ -253,6 +253,7 @@ class UnarchivedDownloader:
         if chat and os.path.exists(chat):
             self.livestream_downloader.file_names.update({'live_chat': FileInfo(chat, file_type='live_chat')})
 
+        self.thumbnail_output = self.livestream_downloader.output_filename(info_dict, options['output'])
         try:
             self.livestream_downloader.stats["status"] = "Recording"
             self.livestream_downloader.download_segments(info_dict=info_dict, resolution='bv+ba/best', options=options)

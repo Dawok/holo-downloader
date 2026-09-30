@@ -1,2 +1,15 @@
 {% from 'ui.html' import stream_list with context %}
-{{ stream_list(active_downloads) }}
+{% set waiting_jobs = active_downloads | selectattr('is_waiting') | list %}
+{% set recording_jobs = active_downloads | rejectattr('is_waiting') | list %}
+<div class="recording-tabs" data-recording-tabs data-selected-tab="recording" data-counter="active" data-count="{{ active_downloads | length }}">
+    <div class="recording-tab-list" role="group" aria-label="Recording status">
+        <button class="recording-tab" type="button" data-recording-tab="recording" aria-pressed="true" aria-controls="recording-panel">Recording <span class="recording-tab-count">{{ recording_jobs | length }}</span></button>
+        <button class="recording-tab" type="button" data-recording-tab="waiting" aria-pressed="false" aria-controls="waiting-panel">Waiting <span class="recording-tab-count">{{ waiting_jobs | length }}</span></button>
+    </div>
+    <section class="recording-tab-panel" id="recording-panel" data-recording-panel="recording" aria-label="Recording streams">
+        {{ stream_list(recording_jobs, counter=false) }}
+    </section>
+    <section class="recording-tab-panel" id="waiting-panel" data-recording-panel="waiting" aria-label="Waiting streams" hidden>
+        {{ stream_list(waiting_jobs, waiting=true, counter=false) }}
+    </section>
+</div>

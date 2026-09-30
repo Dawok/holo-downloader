@@ -1,3 +1,4 @@
+import base64
 import importlib.util
 import logging
 import os
@@ -17,6 +18,8 @@ from channel_config import channels_from_config, read_config
 
 CHANNEL_ID = 'UC' + 'a' * 22
 ROOT = Path(__file__).resolve().parents[1]
+THUMBNAIL_PNG = base64.b64decode(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1cAAAAASUVORK5CYII=')
 
 
 class WebUiTests(unittest.TestCase):
@@ -185,6 +188,7 @@ class WebUiTests(unittest.TestCase):
         with patch.object(self.web, 'DB_FILE', str(legacy_db)):
             self.web.init_db()
             self.assertEqual(self.web.get_history()[0]['video_id'], 'abcdefghijk')
+            self.assertFalse(self.web.get_history()[0]['has_thumbnail'])
             self.web.save_to_history('bcdefghijkl', {'status': 'Finished'}, info={'title': 'Recorded title', 'channel': 'Example channel'})
             self.assertEqual(self.web.get_history()[0]['title'], 'Recorded title')
             self.assertEqual(self.client.get('/data/history').status_code, 200)
@@ -193,7 +197,8 @@ class WebUiTests(unittest.TestCase):
         downloader = SimpleNamespace(info_dict={'title': '<script>alert(1)</script>', 'channel': 'Example channel'}, embed_info={},
                                      livestream_downloader=SimpleNamespace(stats={'status': 'Recording', 'video': {'current_filesize': 1024}}),
                                      kill_this=threading.Event())
-        self.web.active_downloads['abcdefghijk'] = {'downloader': downloader, 'type': 'stream', 'start_time': datetime.now() - timedelta(hours=2)}
+        started = datetime.now() - timedelta(hours=2)
+        self.web.active_downloads['abcdefghijk'] = {'downloader': downloader, 'type': 'stream', 'start_time': started, 'recording_start_time': started}
         response = self.client.get('/data/active')
         self.assertEqual(response.status_code, 200)
         self.assertIn(b'&lt;script&gt;', response.data)
@@ -203,6 +208,36 @@ class WebUiTests(unittest.TestCase):
         self.assertEqual(self.post('/actions/cancel/abcdefghijk').status_code, 302)
         self.assertTrue(downloader.kill_this.is_set())
 
+    def test_waiting_streams_have_a_separate_tab_and_no_timer(self):
+        downloader = SimpleNamespace(info_dict={'title': 'Upcoming stream', 'channel': 'Example channel'}, embed_info={},
+                                     livestream_downloader=SimpleNamespace(stats={'status': 'Waiting', 'video': {}, 'audio': {}}),
+                                     kill_this=threading.Event())
+        self.web.active_downloads['abcdefghijk'] = {
+            'downloader': downloader,
+            'type': 'stream',
+            'start_time': datetime.now() - timedelta(seconds=90),
+            'recording_start_time': None,
+        }
+
+        waiting_job = self.client.get('/api/active').json[0]
+        self.assertTrue(waiting_job['is_waiting'])
+        self.assertIsNone(waiting_job['start_timestamp'])
+        self.assertIsNone(waiting_job['elapsed'])
+
+        response = self.client.get('/data/active')
+        self.assertIn(b'Waiting <span class="recording-tab-count">1</span>', response.data)
+        waiting_panel = response.data.split(b'id="waiting-panel"', 1)[1]
+        self.assertIn(b'Upcoming stream', waiting_panel)
+        self.assertIn(b'Waiting for stream', waiting_panel)
+        self.assertNotIn(b'data-started=', waiting_panel)
+        self.assertNotIn(b'running time', waiting_panel)
+
+        downloader.livestream_downloader.stats['status'] = 'Recording'
+        recording_job = self.client.get('/api/active').json[0]
+        self.assertFalse(recording_job['is_waiting'])
+        self.assertIsNotNone(recording_job['start_timestamp'])
+        self.assertEqual(recording_job['elapsed'], '00:00:00')
+
     def test_finished_job_stores_embed_fallback_and_refreshes_history(self):
         self.client.get('/data/history')
         downloader = SimpleNamespace(info_dict={'title': None}, embed_info={'title': 'Fallback title', 'author_name': 'Example channel'},
@@ -211,6 +246,95 @@ class WebUiTests(unittest.TestCase):
         self.web.thread_worker('abcdefghijk', downloader)
         self.assertIn(b'Fallback title', self.client.get('/data/history').data)
         self.assertNotIn('abcdefghijk', self.web.active_downloads)
+
+    def test_finished_jobs_keep_the_archived_thumbnail_with_history(self):
+        for download_type in ('stream', 'unarchived'):
+            with self.subTest(download_type=download_type):
+                archive = self.path.parent / download_type / 'Example stream'
+                archive.parent.mkdir()
+                thumbnail = Path(f'{archive}.png')
+                thumbnail.write_bytes(THUMBNAIL_PNG)
+                stale_temp_path = self.path.parent / 'removed-temp-thumbnail.png'
+                downloader = SimpleNamespace(
+                    info_dict={'title': 'Archived stream'}, embed_info={},
+                    thumbnail_output=str(archive), main=Mock(),
+                    livestream_downloader=SimpleNamespace(
+                        stats={'status': 'Finished'}, file_names={'thumbnail': stale_temp_path}))
+                tracker = (self.web.active_unarchived_downloads if download_type == 'unarchived'
+                           else self.web.active_downloads)
+                tracker['abcdefghijk'] = {'downloader': downloader, 'type': download_type}
+                self.web.cache.clear()
+                self.client.get('/data/history')
+                self.web.thread_worker('abcdefghijk', downloader, tracker)
+                row = self.web.get_history()[0]
+                self.assertTrue(row['has_thumbnail'])
+                self.assertNotIn('abcdefghijk', tracker)
+                url = f"/history/{row['id']}/thumbnail"
+                for route in ('/data/history', '/data/recent', '/activity'):
+                    self.assertIn(f'src="{url}"'.encode(), self.client.get(route).data)
+                # History keeps its own copy if archived files are later moved or removed.
+                thumbnail.unlink()
+                response = self.client.get(url)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.mimetype, 'image/png')
+                self.assertEqual(response.data, THUMBNAIL_PNG)
+                self.assertIn('max-age=86400', response.headers['Cache-Control'])
+                api_row = self.client.get('/api/history').json[0]
+                self.assertTrue(api_row['has_thumbnail'])
+                self.assertNotIn('thumbnail', api_row)
+                self.assertNotIn('thumbnail_path', api_row)
+
+    def test_thumbnail_can_still_be_found_at_its_original_path(self):
+        thumbnail = self.path.parent / 'thumbnail.png'
+        thumbnail.write_bytes(THUMBNAIL_PNG)
+        downloader = SimpleNamespace(
+            thumbnail_output=str(self.path.parent / 'missing-archive'),
+            livestream_downloader=SimpleNamespace(file_names={'thumbnail': thumbnail}))
+        self.assertEqual(self.web.get_download_thumbnail(downloader), thumbnail)
+        thumbnail.unlink()
+        self.assertIsNone(self.web.get_download_thumbnail(downloader))
+
+    def test_missing_or_unsupported_thumbnails_do_not_prevent_history(self):
+        unsupported = self.path.parent / 'thumbnail.svg'
+        unsupported.write_text('<svg xmlns="http://www.w3.org/2000/svg"></svg>')
+        for thumbnail in (None, self.path.parent / 'missing.png', unsupported):
+            with self.subTest(thumbnail=thumbnail):
+                self.web.save_to_history('abcdefghijk', {'status': 'Finished'}, thumbnail_path=thumbnail)
+                row = self.web.get_history()[0]
+                self.assertFalse(row['has_thumbnail'])
+                self.assertEqual(self.client.get(f"/history/{row['id']}/thumbnail").status_code, 404)
+        self.web.cache.clear()
+        response = self.client.get('/data/history')
+        self.assertIn(b'src="https://i.ytimg.com/vi/abcdefghijk/mqdefault.jpg"', response.data)
+        self.assertIn(b'data-history-thumbnail', response.data)
+        self.assertEqual(self.client.get('/history/999999/thumbnail').status_code, 404)
+
+    def test_unreadable_thumbnail_does_not_prevent_history(self):
+        with patch.object(Path, 'read_bytes', side_effect=PermissionError):
+            self.web.save_to_history('abcdefghijk', {'status': 'Finished'}, thumbnail_path='thumbnail.png')
+        self.assertEqual(len(self.web.get_history()), 1)
+        self.assertFalse(self.web.get_history()[0]['has_thumbnail'])
+        downloader = SimpleNamespace(
+            info_dict={}, embed_info={}, main=Mock(), thumbnail_output='archive/stream',
+            livestream_downloader=SimpleNamespace(
+                stats={'status': 'Finished'}, file_names={'thumbnail': Path('thumbnail.png')}))
+        self.web.active_downloads['bcdefghijkl'] = {'downloader': downloader, 'type': 'stream'}
+        with patch.object(Path, 'is_file', side_effect=PermissionError):
+            self.web.thread_worker('bcdefghijkl', downloader)
+        self.assertEqual(len(self.web.get_history()), 2)
+        self.assertFalse(self.web.get_history()[0]['has_thumbnail'])
+
+    def test_thumbnail_copies_expire_with_their_history_entries(self):
+        thumbnail = self.path.parent / 'thumbnail.png'
+        thumbnail.write_bytes(THUMBNAIL_PNG)
+        self.web.save_to_history('abcdefghijk', {'status': 'Finished'}, thumbnail_path=thumbnail)
+        first_id = self.web.get_history()[0]['id']
+        for _ in range(50):
+            self.web.save_to_history('abcdefghijk', {'status': 'Finished'}, thumbnail_path=thumbnail)
+        self.assertEqual(len(self.web.get_history()), 50)
+        self.assertEqual(self.client.get(f'/history/{first_id}/thumbnail').status_code, 404)
+        latest_id = self.web.get_history()[0]['id']
+        self.assertEqual(self.client.get(f'/history/{latest_id}/thumbnail').data, THUMBNAIL_PNG)
 
     def test_theme_is_per_session_and_keeps_current_page(self):
         other_client = self.web.app.test_client()

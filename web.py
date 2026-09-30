@@ -9,7 +9,9 @@ import secrets
 import hmac
 from contextlib import closing
 from datetime import datetime
-from flask import Flask, abort, render_template, request, redirect, send_from_directory, url_for, flash, make_response, jsonify, session
+from io import BytesIO
+from pathlib import Path
+from flask import Flask, abort, render_template, request, redirect, send_file, send_from_directory, url_for, flash, make_response, jsonify, session
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.job import Job
 from apscheduler.triggers.cron import CronTrigger
@@ -41,6 +43,10 @@ except ValueError:
 # --- Configuration & Constants ---
 config_file_path = 'config.toml'
 DB_FILE = os.environ.get('HISTORY_DB', 'stream_history.db')
+THUMBNAIL_MIME_TYPES = {
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+    '.webp': 'image/webp', '.gif': 'image/gif', '.avif': 'image/avif',
+}
 LOCK = threading.Lock()
 
 scheduler = BackgroundScheduler(daemon=True)
@@ -114,12 +120,23 @@ def init_db():
             )
         ''')
         columns = {row[1] for row in conn.execute('PRAGMA table_info(history)')}
-        for column in ('title', 'channel'):
+        for column, column_type in (('title', 'TEXT'), ('channel', 'TEXT'),
+                                    ('thumbnail', 'BLOB'), ('thumbnail_mime_type', 'TEXT')):
             if column not in columns:
-                conn.execute(f'ALTER TABLE history ADD COLUMN {column} TEXT')
+                conn.execute(f'ALTER TABLE history ADD COLUMN {column} {column_type}')
 
-def save_to_history(video_id, stats, download_type="Unknown", info=None):
+def save_to_history(video_id, stats, download_type="Unknown", info=None, thumbnail_path=None):
     """Saves finished stream to DB and ensures only last 50 exist."""
+    thumbnail = thumbnail_mime_type = None
+    if thumbnail_path:
+        path = Path(thumbnail_path)
+        mime_type = THUMBNAIL_MIME_TYPES.get(path.suffix.lower())
+        if mime_type:
+            try:
+                thumbnail = path.read_bytes() or None
+                thumbnail_mime_type = mime_type if thumbnail else None
+            except OSError:
+                app.logger.warning('Could not read archived thumbnail for %s', video_id)
     # Use context manager for auto-closing
     with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         c = conn.cursor()
@@ -130,10 +147,13 @@ def save_to_history(video_id, stats, download_type="Unknown", info=None):
         download_size = vid_size + aud_size
 
         info = info or {}
-        c.execute('INSERT INTO history (video_id, type, total_size, status, title, channel) VALUES (?, ?, ?, ?, ?, ?)',
+        c.execute('''INSERT INTO history
+                     (video_id, type, total_size, status, title, channel, thumbnail, thumbnail_mime_type)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
                   (video_id, download_type, download_size, stats.get("status", None),
                    info.get('fulltitle') or info.get('title'),
-                   info.get('channel') or info.get('uploader') or info.get('author_name')))
+                   info.get('channel') or info.get('uploader') or info.get('author_name'),
+                   thumbnail, thumbnail_mime_type))
         
         # Cleanup old history
         c.execute('''
@@ -147,7 +167,9 @@ def get_history():
     with closing(sqlite3.connect(DB_FILE)) as conn:
         conn.row_factory = sqlite3.Row
         # We execute directly on the connection for brevity
-        rows = conn.execute('SELECT * FROM history ORDER BY id DESC').fetchall()
+        rows = conn.execute('''SELECT id, video_id, type, status, total_size, timestamp, title, channel,
+                               thumbnail IS NOT NULL AS has_thumbnail
+                               FROM history ORDER BY id DESC''').fetchall()
         return rows
 
 # --- Config Management (Unchanged from previous update) ---
@@ -181,6 +203,23 @@ def get_download_metadata(downloader):
         'channel': info.get('channel') or info.get('uploader') or embed.get('author_name')
     }
 
+def get_download_thumbnail(downloader):
+    """Find the saved thumbnail, including files moved out of the temporary folder."""
+    file_names = getattr(downloader.livestream_downloader, 'file_names', {})
+    thumbnail = file_names.get('thumbnail')
+    if not thumbnail:
+        return None
+    thumbnail = Path(thumbnail)
+    output = getattr(downloader, 'thumbnail_output', None)
+    candidates = [Path(f'{output}{thumbnail.suffix}'), thumbnail] if output else [thumbnail]
+    for path in candidates:
+        try:
+            if path.is_file():
+                return path
+        except OSError:
+            continue
+    return None
+
 # --- Core Logic & Threading ---
 
 def thread_worker(video_id, downloader, thread_tracker: dict = active_downloads):
@@ -189,7 +228,8 @@ def thread_worker(video_id, downloader, thread_tracker: dict = active_downloads)
         downloader.main()
         save_to_history(video_id, downloader.livestream_downloader.stats,
                         download_type=thread_tracker.get(video_id, {}).get("type", "Unknown"),
-                        info=get_download_metadata(downloader))
+                        info=get_download_metadata(downloader),
+                        thumbnail_path=get_download_thumbnail(downloader))
         
         with app.app_context():
             cache.delete('history-fragment')
@@ -226,7 +266,8 @@ def start_download(video_id):
             'downloader': downloader,
             'thread': thread,
             'type': "stream",
-            'start_time': datetime.now()
+            'start_time': datetime.now(),
+            'recording_start_time': None
         }
         
         thread.start()
@@ -375,14 +416,23 @@ def get_active_jobs_data():
         for vid, job in active_downloads.copy().items():
             downloader: downloadVid.VideoDownloader = job['downloader']
             display_info = get_download_metadata(downloader)
+            stats = downloader.livestream_downloader.stats
+            status = str(stats.get('status') or '').strip().lower()
+            is_waiting = status.startswith('waiting')
+            if status == 'recording' and job.get('recording_start_time') is None:
+                job['recording_start_time'] = datetime.now()
+            recording_start_time = job.get('recording_start_time')
+            timer_start = recording_start_time if not is_waiting else None
+            display_start = timer_start or job['start_time']
 
             current_jobs.append({
                 'id': vid,
-                'stats': downloader.livestream_downloader.stats,
+                'stats': stats,
                 'info': display_info, # Pass the small dict, not the huge one
-                'start_time': job['start_time'].strftime('%H:%M:%S'),
-                'start_timestamp': job['start_time'].timestamp(),
-                'elapsed': elapsed_time(job['start_time'])
+                'start_time': display_start.strftime('%H:%M:%S'),
+                'start_timestamp': timer_start.timestamp() if timer_start else None,
+                'elapsed': elapsed_time(timer_start) if timer_start else None,
+                'is_waiting': is_waiting
             })
     return current_jobs
 
@@ -473,6 +523,15 @@ def data_history():
     """Endpoint for HTMX to poll history table."""
     history = get_history()
     return render_template('history_table.html', history=history)
+
+@app.route('/history/<int:history_id>/thumbnail')
+def history_thumbnail(history_id):
+    with closing(sqlite3.connect(DB_FILE)) as conn:
+        row = conn.execute('SELECT thumbnail, thumbnail_mime_type FROM history WHERE id = ?',
+                           (history_id,)).fetchone()
+    if not row or not row[0] or row[1] not in THUMBNAIL_MIME_TYPES.values():
+        abort(404)
+    return send_file(BytesIO(row[0]), mimetype=row[1], max_age=86400)
 
 @app.route('/data/recent')
 def data_recent():

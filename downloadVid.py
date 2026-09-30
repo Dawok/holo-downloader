@@ -92,6 +92,7 @@ class VideoDownloader():
 
         # Options retrieved using the passed config object
         options: dict = self.config.get_livestream_dl_options(info_dict=info_dict, output_template=self.outputFile)
+        self.thumbnail_output = self.livestream_downloader.output_filename(info_dict, options["output"])
         
         # Start additional information downloaders (Discord notification)
         # NOTE: Assuming discord_web.main is updated to accept the config object
