@@ -95,6 +95,15 @@ class VideoDownloader():
         # Options retrieved using the passed config object
         options: dict = self.config.get_livestream_dl_options(info_dict=info_dict, output_template=self.outputFile)
         self.thumbnail_output = self.livestream_downloader.output_filename(info_dict, options["output"])
+
+        # Track a stream-specific folder before recording starts. Cancelled
+        # downloads can leave partial files that are absent from file_names.
+        configured_temp = Path(options["temp_folder"]).expanduser()
+        temp_folder = Path(self.livestream_downloader.output_filename(info_dict, str(configured_temp)))
+        if temp_folder == configured_temp or not any(self.id in part for part in temp_folder.parts):
+            temp_folder /= self.id
+        self.temp_output_dir = str(temp_folder)
+        options["temp_folder"] = self.temp_output_dir
         
         # Start additional information downloaders (Discord notification)
         # NOTE: Assuming discord_web.main is updated to accept the config object
@@ -103,10 +112,7 @@ class VideoDownloader():
         
         try:            
             self.livestream_downloader.stats["status"] = "Recording"
-            try:
-                self.livestream_downloader.download_segments(info_dict=info_dict, resolution=options.get("resolution"), options=options)
-            finally:
-                self.temp_output_dir = options.get("temp_folder")
+            self.livestream_downloader.download_segments(info_dict=info_dict, resolution=options.get("resolution"), options=options)
             
             if self.kill_this.is_set():
                 self.livestream_downloader.stats["status"] = "Cancelled"

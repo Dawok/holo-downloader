@@ -286,6 +286,98 @@ class WebUiTests(unittest.TestCase):
         self.assertIs(self.web.active_downloads['abcdefghijk']['downloader'], replacement)
         self.assertFalse(self.web.is_stream_removed('abcdefghijk'))
 
+    def test_removing_recording_deletes_untracked_partial_files_for_all_temp_layouts(self):
+        modules = {
+            'common': SimpleNamespace(FileLock=Mock(), setup_umask=Mock(),
+                                      kill_all=threading.Event(), initialize_logging=Mock()),
+            'discord_web': SimpleNamespace(main=Mock()),
+            'getConfig': SimpleNamespace(ConfigHandler=Mock()),
+            'livestream_dl': SimpleNamespace(download_Live=SimpleNamespace(), getUrls=SimpleNamespace()),
+        }
+        spec = importlib.util.spec_from_file_location('recording_under_test', ROOT / 'downloadVid.py')
+        recording = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, modules):
+            spec.loader.exec_module(recording)
+
+        for layout in ('shared', 'template', 'stream-template'):
+            with self.subTest(layout=layout):
+                temp_root = self.path.parent / layout / 'temp'
+                temp_root.mkdir(parents=True)
+                configured_temp = {
+                    'shared': temp_root,
+                    'template': temp_root / '%(channel)s' / '%(title)s',
+                    'stream-template': temp_root / '%(channel)s' / '%(title)s (%(id)s)',
+                }[layout]
+                other_file = temp_root / 'bcdefghijkl' / 'video.temp'
+                other_file.parent.mkdir()
+                other_file.write_bytes(b'other recording')
+                shared_file = temp_root / 'unrelated.temp'
+                shared_file.write_bytes(b'keep shared files')
+                archive = temp_root.parent / 'Done'
+                archive.mkdir()
+                final_file = archive / 'finished.mp4'
+                final_file.write_bytes(b'archived recording')
+                info = {'id': 'abcdefghijk', 'title': 'Example stream',
+                        'fulltitle': 'Example stream', 'channel': 'Example channel'}
+                started = threading.Event()
+                folders = []
+                downloader = recording.VideoDownloader.__new__(recording.VideoDownloader)
+                downloader.id = info['id']
+                downloader.kill_this = threading.Event()
+                downloader.logger = logging.getLogger('recording-removal-tests')
+                downloader.info_dict = {}
+                downloader.embed_info = {}
+                downloader.temp_output_dir = None
+                downloader.download_video_info = Mock(return_value=('Example stream', info))
+                downloader.config = SimpleNamespace(
+                    get_temp_folder=lambda: str(configured_temp),
+                    get_livestream_dl_options=lambda **kwargs: {
+                        'temp_folder': str(configured_temp), 'output': str(archive / 'Example stream'),
+                    },
+                )
+
+                def output_filename(metadata, template):
+                    with recording.yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                        return ydl.prepare_filename(metadata, outtmpl=template)
+
+                def download_segments(info_dict, resolution, options):
+                    # A library may copy its options and leave these files out
+                    # of file_names when cancellation interrupts recording.
+                    local_options = options.copy()
+                    folder = Path(output_filename(info_dict, local_options['temp_folder']))
+                    local_options['temp_folder'] = str(folder)
+                    folder.mkdir(parents=True, exist_ok=True)
+                    folders.append(folder)
+                    for filename in ('video.137.temp', 'video.137.temp-wal', 'audio.140.ts', 'chat.json.part'):
+                        (folder / filename).write_bytes(b'partial recording')
+                    started.set()
+                    if not downloader.kill_this.wait(5):
+                        raise TimeoutError('Recording was not removed')
+                    raise KeyboardInterrupt('Recording was removed')
+
+                downloader.livestream_downloader = SimpleNamespace(
+                    stats={}, file_names={'streams': {}, 'databases': []},
+                    output_filename=output_filename, download_segments=download_segments,
+                )
+                self.web.active_downloads[info['id']] = {'downloader': downloader, 'type': 'stream'}
+                worker = threading.Thread(target=self.web.thread_worker,
+                                          args=(info['id'], downloader), daemon=True)
+                try:
+                    worker.start()
+                    self.assertTrue(started.wait(5))
+                    self.assertEqual(self.post(f'/actions/cancel/{info["id"]}').status_code, 302)
+                    worker.join(5)
+                    self.assertFalse(worker.is_alive())
+                    self.assertFalse(folders[0].exists())
+                    self.assertEqual(other_file.read_bytes(), b'other recording')
+                    self.assertEqual(shared_file.read_bytes(), b'keep shared files')
+                    self.assertEqual(final_file.read_bytes(), b'archived recording')
+                    self.assertNotIn(info['id'], self.web.active_downloads)
+                    self.assertFalse(self.web.get_history())
+                finally:
+                    downloader.kill_this.set()
+                    worker.join(5)
+
     def test_finished_job_stores_embed_fallback_and_refreshes_history(self):
         self.client.get('/data/history')
         downloader = SimpleNamespace(info_dict={'title': None}, embed_info={'title': 'Fallback title', 'author_name': 'Example channel'},
