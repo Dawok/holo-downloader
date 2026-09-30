@@ -5,12 +5,18 @@ import time
 import sqlite3
 import random
 import sys
+import secrets
+import hmac
+from contextlib import closing
 from datetime import datetime
-from flask import Flask, abort, render_template, request, redirect, send_from_directory, url_for, flash, make_response, jsonify
+from flask import Flask, abort, render_template, request, redirect, send_from_directory, url_for, flash, make_response, jsonify, session
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.job import Job
 from apscheduler.triggers.cron import CronTrigger
 import tomlkit
+from channel_config import (CONFIG_LOCK, read_config, write_config,
+                            channels_from_config, empty_channel, save_channel,
+                            delete_channel, channel_url, CHANNEL_TABLES)
 
 from getConfig import ConfigHandler, config_file_path
 import downloadVid
@@ -34,7 +40,7 @@ except ValueError:
 
 # --- Configuration & Constants ---
 config_file_path = 'config.toml'
-DB_FILE = 'stream_history.db'
+DB_FILE = os.environ.get('HISTORY_DB', 'stream_history.db')
 LOCK = threading.Lock()
 
 scheduler = BackgroundScheduler(daemon=True)
@@ -60,10 +66,42 @@ GLOBAL_THEME = "dark"
 
 history_update_event = threading.Event()
 
+
+@app.context_processor
+def shared_ui_context():
+    if 'csrf_token' not in session:
+        session['csrf_token'] = secrets.token_urlsafe(32)
+    return {'csrf_token': session['csrf_token'], 'theme': session.get('theme', GLOBAL_THEME)}
+
+
+@app.before_request
+def protect_form_requests():
+    if request.method == 'POST':
+        expected = session.get('csrf_token', '')
+        provided = request.form.get('csrf_token', '') or request.headers.get('X-CSRF-Token', '')
+        if not expected or not hmac.compare_digest(expected.encode(), provided.encode()):
+            if request.path.startswith('/api/'):
+                return jsonify(error='Your session expired. Reload the page and try again.'), 400
+            return render_template('error.html', message='Your session expired. Reload the page and try again.'), 400
+
+
+@app.template_filter('status_class')
+def status_class(value):
+    status = str(value or '').lower()
+    if 'error' in status or 'failed' in status:
+        return 'danger'
+    if 'warning' in status or 'waiting' in status:
+        return 'warning'
+    if status in {'finished', 'recording', 'scheduled'}:
+        return 'success'
+    if status in {'monitoring', 'get chat', 'muxing', 'moving'}:
+        return 'info'
+    return 'muted'
+
 # --- Database Management ---
 
 def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         conn.execute('PRAGMA journal_mode=WAL;')
         conn.execute('''
             CREATE TABLE IF NOT EXISTS history (
@@ -75,11 +113,15 @@ def init_db():
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(history)')}
+        for column in ('title', 'channel'):
+            if column not in columns:
+                conn.execute(f'ALTER TABLE history ADD COLUMN {column} TEXT')
 
-def save_to_history(video_id, stats, download_type="Unknown"):
+def save_to_history(video_id, stats, download_type="Unknown", info=None):
     """Saves finished stream to DB and ensures only last 50 exist."""
     # Use context manager for auto-closing
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         c = conn.cursor()
         
         # Safe access to nested dicts using .get with defaults
@@ -87,8 +129,11 @@ def save_to_history(video_id, stats, download_type="Unknown"):
         aud_size = stats.get('audio', {}).get("current_filesize", 0) or 0
         download_size = vid_size + aud_size
 
-        c.execute('INSERT INTO history (video_id, type, total_size, status) VALUES (?, ?, ?, ?)',
-                  (video_id, download_type, download_size, stats.get("status", None)))
+        info = info or {}
+        c.execute('INSERT INTO history (video_id, type, total_size, status, title, channel) VALUES (?, ?, ?, ?, ?, ?)',
+                  (video_id, download_type, download_size, stats.get("status", None),
+                   info.get('fulltitle') or info.get('title'),
+                   info.get('channel') or info.get('uploader') or info.get('author_name')))
         
         # Cleanup old history
         c.execute('''
@@ -99,7 +144,7 @@ def save_to_history(video_id, stats, download_type="Unknown"):
         conn.commit()
 
 def get_history():
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn:
         conn.row_factory = sqlite3.Row
         # We execute directly on the connection for brevity
         rows = conn.execute('SELECT * FROM history ORDER BY id DESC').fetchall()
@@ -120,14 +165,21 @@ def load_config():
             
     return ConfigHandler(config_file=config_file_path)
 
-def save_config(content):
+def save_config(content, expected_revision):
     try:
-        tomlkit.parse(content)
-        with open(config_file_path, "w", encoding="utf-8", newline="") as f:
-            f.write(content)
+        write_config(config_file_path, content, expected_revision)
         return True, "Config saved"
     except Exception as e:
         return False, str(e)
+
+def get_download_metadata(downloader):
+    info = downloader.info_dict
+    embed = downloader.embed_info
+    return {
+        'fulltitle': info.get('fulltitle'),
+        'title': info.get('title') or embed.get('title'),
+        'channel': info.get('channel') or info.get('uploader') or embed.get('author_name')
+    }
 
 # --- Core Logic & Threading ---
 
@@ -135,10 +187,12 @@ def thread_worker(video_id, downloader, thread_tracker: dict = active_downloads)
     global recently_finished
     try:
         downloader.main()
-        save_to_history(video_id, downloader.livestream_downloader.stats, download_type=thread_tracker.get(video_id, {}).get("type", "Unknown"))
+        save_to_history(video_id, downloader.livestream_downloader.stats,
+                        download_type=thread_tracker.get(video_id, {}).get("type", "Unknown"),
+                        info=get_download_metadata(downloader))
         
         with app.app_context():
-            cache.delete_memoized(data_history)
+            cache.delete('history-fragment')
         
         history_update_event.set()
             
@@ -165,7 +219,7 @@ def start_download(video_id):
         if id in active_downloads:
             return False 
 
-        downloader = downloadVid.VideoDownloader(id=video_id)
+        downloader = downloadVid.VideoDownloader(id=video_id, config=load_config())
         thread = threading.Thread(target=thread_worker, args=(id, downloader, active_downloads), daemon=True)
         
         active_downloads[id] = {
@@ -183,7 +237,7 @@ def start_unarchived_download(video_id):
         if video_id in active_unarchived_downloads:
             return False 
 
-        downloader = unarchived.UnarchivedDownloader(id=video_id)
+        downloader = unarchived.UnarchivedDownloader(id=video_id, config=load_config())
         thread = threading.Thread(target=thread_worker, args=(video_id, downloader, active_unarchived_downloads), daemon=True)
         
         active_unarchived_downloads[video_id] = {
@@ -258,17 +312,17 @@ def get_videos_with_queue(discovery_func, download_func, *args, **kwargs):
                 break
 
 def get_streams():
-    get_videos_with_queue(getVids.main, start_download, unarchived=False, return_dict=True)
+    get_videos_with_queue(getVids.main, start_download, unarchived=False, return_dict=True, config=load_config())
 
 def get_unarchived():
-    get_videos_with_queue(getVids.main, start_unarchived_download, unarchived=True, return_dict=False)
+    get_videos_with_queue(getVids.main, start_unarchived_download, unarchived=True, return_dict=False, config=load_config())
 
 def get_members():
-    get_videos_with_queue(getMembers.main, start_download, return_dict=True)
+    get_videos_with_queue(getMembers.main, start_download, return_dict=True, config=load_config())
 
 def get_community_tab():
     common.logger.info("Running scheduled stream check...")
-    communityPosts.main()
+    communityPosts.main(config=load_config())
 
 def update_scheduler():
     config = load_config()
@@ -320,18 +374,15 @@ def get_active_jobs_data():
         current_jobs = []
         for vid, job in active_downloads.copy().items():
             downloader: downloadVid.VideoDownloader = job['downloader']
-
-            downloader: downloadVid.VideoDownloader = job['downloader']
-            display_info = {
-                'fulltitle': downloader.info_dict.get('fulltitle'),
-                'title': downloader.embed_info.get('title')
-            }
+            display_info = get_download_metadata(downloader)
 
             current_jobs.append({
                 'id': vid,
                 'stats': downloader.livestream_downloader.stats,
                 'info': display_info, # Pass the small dict, not the huge one
-                'start_time': job['start_time'].strftime('%H:%M:%S')
+                'start_time': job['start_time'].strftime('%H:%M:%S'),
+                'start_timestamp': job['start_time'].timestamp(),
+                'elapsed': elapsed_time(job['start_time'])
             })
     return current_jobs
 
@@ -341,18 +392,23 @@ def get_active_unarchived_jobs_data():
         current_jobs = []
         for vid, job in active_unarchived_downloads.copy().items():
             downloader: downloadVid.VideoDownloader = job['downloader']
-            display_info = {
-                'fulltitle': downloader.info_dict.get('fulltitle'),
-                'title': downloader.embed_info.get('title')
-            }
+            display_info = get_download_metadata(downloader)
 
             current_jobs.append({
                 'id': vid,
                 'stats': downloader.livestream_downloader.stats,
                 'info': display_info, # Pass the small dict, not the huge one
-                'start_time': job['start_time'].strftime('%H:%M:%S')
+                'start_time': job['start_time'].strftime('%H:%M:%S'),
+                'start_timestamp': job['start_time'].timestamp(),
+                'elapsed': elapsed_time(job['start_time'])
             })
     return current_jobs
+
+def elapsed_time(started):
+    seconds = max(0, int(time.time() - started.timestamp()))
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f'{hours:02}:{minutes:02}:{seconds:02}'
 
 # --- Helper to format byte strings ---
 def convert_bytes(bytes):
@@ -412,11 +468,15 @@ def data_unarchived():
     return response
 
 @app.route('/data/history')
-@cache.cached(timeout=600) # Cache this result for 10 minutes (or until cleared)
+@cache.cached(timeout=30, key_prefix='history-fragment')
 def data_history():
     """Endpoint for HTMX to poll history table."""
     history = get_history()
     return render_template('history_table.html', history=history)
+
+@app.route('/data/recent')
+def data_recent():
+    return render_template('history_table.html', history=get_history()[:5], recent=True)
 
 
 # --- Web Routes (Unchanged) ---
@@ -429,7 +489,8 @@ def index():
     return render_template('index.html', 
                                   history=history,
                                   active_downloads=active_jobs,
-                                  theme=GLOBAL_THEME,
+                                  monitors=get_active_unarchived_jobs_data(),
+                                  channel_count=len(channels_from_config(read_config(config_file_path)[0])),
                                   ) 
 
 @app.route('/actions/check', methods=['POST'])
@@ -489,7 +550,10 @@ def extract_youtube_id(url: str):
 def manual_add():
     video_id = request.form.get('video_id')
     if video_id:
-        video_id = extract_youtube_id(str(video_id)) or video_id
+        video_id = extract_youtube_id(str(video_id))
+        if not video_id:
+            flash('Enter a valid YouTube video link or 11-character video ID.', 'danger')
+            return redirect(url_for('index'))
         if start_download(video_id):
             flash(f"Started download for {video_id}", "success")
         else:
@@ -498,22 +562,134 @@ def manual_add():
 
 @app.route('/config', methods=['GET', 'POST'])
 def config_page():
+    doc, config_revision = read_config(config_file_path)
+    content = tomlkit.dumps(doc)
     if request.method == 'POST':
-        new_toml = request.form.get('toml_content')
-        if save_config(new_toml):
+        content = request.form.get('toml_content', '')
+        success, message = save_config(content, request.form.get('revision', ''))
+        if success:
             success, message = update_scheduler()
             if success:
                 load_config()
                 flash(message, "success")                
             else:
                 flash(message, "danger") 
-        else:
-            flash("Invalid TOML format. Configuration not saved.", "danger")
-        return redirect(url_for('config_page'))
+            return redirect(url_for('config_page'))
+        return render_template('config.html', config_content=content,
+                               revision=request.form.get('revision', ''), error=message), 400
+    return render_template('config.html', config_content=content, revision=config_revision)
 
-    with open(config_file_path, 'r', encoding="utf-8") as f:
-        content = f.read()
-    return render_template('config.html', config_content=content, theme=GLOBAL_THEME)
+
+@app.route('/channels')
+def channels_page():
+    doc, config_revision = read_config(config_file_path)
+    channels = channels_from_config(doc)
+    counts = {mode: sum(channel[mode] for channel in channels) for mode in CHANNEL_TABLES}
+    return render_template('channels.html', channels=channels, counts=counts,
+                           revision=config_revision, query=request.args.get('q', ''),
+                           mode=request.args.get('mode', 'all'))
+
+
+@app.route('/channels/new', methods=['GET', 'POST'])
+@app.route('/channels/<channel_id>/edit', methods=['GET', 'POST'])
+def channel_editor(channel_id=None):
+    doc, config_revision = read_config(config_file_path)
+    channels = channels_from_config(doc)
+    channel = next((item for item in channels if item['id'] == channel_id), None)
+    if channel_id and not channel:
+        abort(404)
+    channel = channel or {**empty_channel(), 'public': True}
+    error = None
+    if request.method == 'POST':
+        channel = dict(request.form)
+        channel['id'] = channel_id or request.form.get('id', '')
+        for mode in CHANNEL_TABLES:
+            channel[mode] = request.form.get(mode) == 'on'
+        config_revision = request.form.get('revision', '')
+        try:
+            saved = save_channel(config_file_path, channel, config_revision, editing=channel_id is not None)
+            flash(f"Saved {saved['name']}. New settings apply to the next channel check.", 'success')
+            return redirect(url_for('channels_page'))
+        except (ValueError, OSError) as exception:
+            error = str(exception)
+    return render_template('channel_editor.html', channel=channel, channels=channels,
+                           editing=channel_id is not None, revision=config_revision,
+                           error=error), 400 if error else 200
+
+
+@app.route('/channels/<channel_id>/delete', methods=['POST'])
+def channel_delete(channel_id):
+    try:
+        delete_channel(config_file_path, channel_id, request.form.get('revision', ''))
+        flash('Channel removed from future checks. Existing recordings are kept.', 'success')
+    except (ValueError, OSError) as exception:
+        flash(str(exception), 'danger')
+    return redirect(url_for('channels_page'))
+
+
+@app.route('/api/channels/resolve', methods=['POST'])
+def resolve_channel():
+    import yt_dlp
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or not isinstance(payload.get('source'), str):
+        return jsonify(error='Enter a channel link, @handle, or ID.'), 400
+    try:
+        url = channel_url(payload['source'])
+    except ValueError as exception:
+        return jsonify(error=str(exception)), 400
+    options = {'quiet': True, 'no_warnings': True, 'extract_flat': True,
+               'playlist_items': '1', 'skip_download': True, 'socket_timeout': 10,
+               'retries': 0, 'extractor_retries': 0}
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+        channel_id = (info or {}).get('channel_id') or (info or {}).get('id', '')
+        name = (info or {}).get('channel') or (info or {}).get('uploader') or (info or {}).get('title')
+        if not re.fullmatch(r'UC[A-Za-z0-9_-]{22}', channel_id) or not name:
+            raise ValueError('Channel details unavailable')
+        doc, _ = read_config(config_file_path)
+        exists = any(channel['id'] == channel_id for channel in channels_from_config(doc))
+        return jsonify(id=channel_id, name=name,
+                       edit_url=url_for('channel_editor', channel_id=channel_id) if exists else None)
+    except Exception:
+        return jsonify(error='Could not look up this channel. Try again, or enter its name and channel ID below.'), 502
+
+
+@app.route('/activity')
+def activity_page():
+    return render_template('activity.html', history=get_history())
+
+
+@app.route('/schedules', methods=['GET', 'POST'])
+def schedules_page():
+    doc, config_revision = read_config(config_file_path)
+    schedules = dict(doc.get('cron_schedule', {}))
+    error = None
+    if request.method == 'POST':
+        config_revision = request.form.get('revision', '')
+        names = ('streams', 'unarchived', 'members_only', 'community_posts')
+        schedules = {name: request.form.get(name, '').strip() for name in names}
+        try:
+            for value in schedules.values():
+                if value:
+                    CronTrigger.from_crontab(value)
+            with CONFIG_LOCK:
+                current_doc, _ = read_config(config_file_path)
+                if 'cron_schedule' not in current_doc:
+                    current_doc['cron_schedule'] = tomlkit.table()
+                for name, value in schedules.items():
+                    if value:
+                        current_doc['cron_schedule'][name] = value
+                    else:
+                        current_doc['cron_schedule'].pop(name, None)
+                write_config(config_file_path, tomlkit.dumps(current_doc), config_revision)
+            update_scheduler()
+            flash('Schedules updated.', 'success')
+            return redirect(url_for('schedules_page'))
+        except (ValueError, OSError) as exception:
+            error = str(exception)
+    return render_template('schedules.html', jobs=get_scheduler_jobs(), schedules=schedules,
+                           revision=config_revision, error=error), 400 if error else 200
 
 @app.route('/actions/cancel/<video_id>', methods=['POST'])
 def cancel_download(video_id):
@@ -559,11 +735,11 @@ def cancel_unarchived(video_id):
 
 @app.route('/actions/toggle_theme', methods=['POST'])
 def toggle_theme():
-    global GLOBAL_THEME
-    with LOCK:
-        GLOBAL_THEME = "dark" if GLOBAL_THEME == "light" else "light"
-    # Redirect to the page that made the request (config or index)
-    return redirect(request.referrer or url_for('index'))
+    session['theme'] = 'dark' if session.get('theme', GLOBAL_THEME) == 'light' else 'light'
+    if request.headers.get('X-Requested-With') == 'fetch':
+        return jsonify(theme=session['theme'])
+    return_to = request.form.get('return_to', '/')
+    return redirect(return_to if return_to.startswith('/') and not return_to.startswith('//') else '/')
 
 # --- Helper for Scheduler Data ---
 
@@ -633,7 +809,7 @@ def force_run_job(job_name):
     else:
         flash(f"Unknown job: {job_name}", "danger")
         
-    return redirect(url_for('index'))
+    return redirect(url_for('schedules_page'))
 
 # --- HTMX Route for Scheduler ---
 

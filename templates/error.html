@@ -1,0 +1,3 @@
+{% extends 'base.html' %}
+{% block title %}Unable to continue{% endblock %}
+{% block content %}<header class="page-heading"><div><h1>Unable to continue</h1><p>{{ message }}</p></div></header><a class="button secondary" href="{{ url_for('index') }}">Back to recordings</a>{% endblock %}

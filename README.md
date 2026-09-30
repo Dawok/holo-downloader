@@ -4,7 +4,7 @@ A robust, schedule-based downloader designed for archiving live streams from You
 
 The program supports standard streams, members-only content, unarchived (private/deleted) streams, and community posts. It is designed primarily to be used in a Docker container, but works on Windows and Linux (with `livestream_dl` and `ffmpeg` installed).
 
-**[Build on Docker Hub](https://hub.docker.com/r/canofsocks/holo-downloader)**
+**[Container image on GitHub Container Registry](https://github.com/dawok/holo-downloader/pkgs/container/holo-downloader)**
 
 ## Features
 
@@ -17,7 +17,8 @@ The program supports standard streams, members-only content, unarchived (private
 
 
 * **Resiliency**: Uses `livestream_dl` (a custom wrapper around `yt-dlp` and `ffmpeg`) to handle stream interruptions and segment merging.
-* **Web UI**: A Flask-based interface (port 5000) to view active downloads, history, and active schedules.
+* **Web UI**: A responsive interface (port 5000) for recordings, searchable history, schedules, and channel settings, with dark and light themes.
+* **Channel Manager**: Add a channel from a YouTube link, handle, or ID and manage its archive options and filters together.
 * **Notifications**: Integrates with Discord Webhooks for status updates (Recording, Done, Error).
 * **Flexible Filtering**: Filter downloads by regex matching on video titles or descriptions.
 
@@ -28,7 +29,7 @@ The recommended way to run this application is via Docker. You will need to crea
 ### Run Command
 
 ```bash
-docker pull 'canofsocks/holo-downloader:latest'
+docker pull 'ghcr.io/dawok/holo-downloader:latest'
 
 docker run -d \
   --name='holo-downloader' \
@@ -42,7 +43,7 @@ docker run -d \
   -v '/mnt/holo-downloader/temp/':'/app/temp':'rw' \
   -v '/mnt/holo-downloader/Done/':'/app/Done':'rw' \
   -v '/mnt/holo-downloader/config/cookies.txt':'/app/cookies.txt':'rw' \
-  'canofsocks/holo-downloader:latest'
+  'ghcr.io/dawok/holo-downloader:latest'
 
 ```
 
@@ -65,6 +66,12 @@ These variables configure the container runtime.
 ## Configuration (`config.toml`)
 
 Configuration is applied via the `config.toml` file. This file must be mounted to `/app/config.toml` in the container.
+
+Use **Settings → Channels → Add channel** in the web UI to look up a channel name and ID, then select public streams, unarchived recovery, members-only streams, or community posts. Title and description filters belong to the same channel form. You can also copy archive options and filters from another channel.
+
+Existing entries from the channel tables are combined in the UI automatically. Saving updates the corresponding TOML tables while keeping unrelated settings and comments. Changes apply to future checks; running recordings keep their current settings. Removing a channel leaves existing recordings intact.
+
+The **Schedules** page edits check frequencies. **Settings → Configuration file** still provides the complete TOML editor. Both editors detect changes from another window before saving.
 
 ### 1. Global Schedules
 

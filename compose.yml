@@ -1,6 +1,6 @@
 services:
   holo-downloader:
-    image: ghcr.io/canofsocks/holo-downloader:main
+    image: ghcr.io/dawok/holo-downloader:main
     container_name: holo-downloader
     restart: unless-stopped
     environment:

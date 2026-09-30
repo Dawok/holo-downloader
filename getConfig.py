@@ -1,18 +1,18 @@
 from sys import argv
+import os
 from pathlib import Path, PurePath
-import tomlkit
+from channel_config import read_config
 
 from livestream_dl.YoutubeURL import quality_aliases
 
-config_file_path = "config.toml"
+config_file_path = os.environ.get("CONFIG_FILE", "config.toml")
 
 class ConfigHandler:
     def __init__(self, config=None, config_file=config_file_path):
         # If no dict provided, load via tomlkit
         if config is None and config_file:
             #config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), config_file)
-            with open(config_file, "rt", encoding="utf-8") as toml_file:
-                config_doc = tomlkit.load(toml_file)
+            config_doc, _ = read_config(config_file)
             # Convert tomlkit document to plain dict for easier usage
             config = config_doc.unwrap()  # or access config_doc[...] directly if you prefer
         self.channel_ids_to_match: dict = config.get("channel_ids_to_match", {})

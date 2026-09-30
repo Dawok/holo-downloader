@@ -1,5 +1,5 @@
 # Use the existing livestream_dl as the base
-FROM ghcr.io/canofsocks/livestream_dl:latest
+FROM ghcr.io/dawok/livestream_dl:latest
 
 ARG PYTHONDONTWRITEBYTECODE=1
 

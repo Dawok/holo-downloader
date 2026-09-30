@@ -1,0 +1,6 @@
+{% extends 'base.html' %}
+{% block title %}History{% endblock %}
+{% block content %}
+<header class="page-heading"><div><h1>History</h1><p>The most recent 50 finished, stopped, or failed recordings.</p></div></header>
+<section class="panel filter-scope"><div class="toolbar"><label class="search-field"><input type="search" data-filter-search placeholder="Search title, channel or video ID" aria-label="Search history"></label><select data-filter-state aria-label="Filter history by status"><option value="all">All statuses</option><option value="finished">Finished</option><option value="error">Errors</option><option value="cancelled">Cancelled</option></select><select data-filter-mode aria-label="Filter history by type"><option value="all">All types</option><option value="stream">Stream</option><option value="unarchived">Unarchived</option></select></div><div data-poll="{{ url_for('data_history') }}" data-interval="30000">{% include 'history_table.html' %}</div><p class="filter-empty" hidden>No recordings match your search.</p></section>
+{% endblock %}

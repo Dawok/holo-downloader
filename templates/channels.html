@@ -1,0 +1,25 @@
+{% extends 'base.html' %}
+{% from 'ui.html' import settings_nav, empty with context %}
+{% block title %}Channels{% endblock %}
+{% block content %}
+<header class="page-heading"><div><h1>Settings</h1><p>Manage channels and what the archiver saves.</p></div></header>
+<div class="settings-layout">{{ settings_nav('channels') }}<div class="settings-pane">
+<div class="pane-heading"><div><h2 class="pane-title">Channels <span class="heading-count">{{ channels | length }}</span></h2><p class="muted">Add a channel once, then choose its archive options and filters.</p></div><a class="button primary" href="{{ url_for('channel_editor') }}">Add channel</a></div>
+<div class="channel-summary"><span>{{ counts.public }} public</span><span>{{ counts.unarchived }} unarchived</span><span>{{ counts.members }} members-only</span><span>{{ counts.community }} community</span></div>
+<section class="panel filter-scope" id="channel-list"><form class="toolbar" method="get"><label class="search-field"><input type="search" name="q" value="{{ query }}" data-filter-search placeholder="Search channel name or ID" aria-label="Search channels"></label><select name="mode" data-filter-mode aria-label="Filter channels by archive option">{% for value, label in [('all', 'All archive options'), ('public', 'Public streams'), ('unarchived', 'Unarchived recovery'), ('members', 'Members-only'), ('community', 'Community posts')] %}<option value="{{ value }}" {{ 'selected' if mode == value }}>{{ label }}</option>{% endfor %}</select><noscript><button class="button secondary">Search</button></noscript></form>
+{% if channels %}
+<div class="list-heading"><span>Channel</span><span>Archive options</span><span class="sr-only">Edit</span></div>
+{% for channel in channels %}
+{% set matches_query = not query or query | lower in channel.name | lower or query | lower in channel.id | lower %}
+{% set matches_mode = mode == 'all' or channel.get(mode, false) %}
+<article class="channel-row filter-item" data-search="{{ channel.name }} {{ channel.id }}" data-modes="{% for key in ['public', 'unarchived', 'members', 'community'] %}{% if channel[key] %}{{ key }} {% endif %}{% endfor %}" {% if not matches_query or not matches_mode %}hidden{% endif %}>
+    <div class="channel-identity"><a class="channel-name" href="{{ url_for('channel_editor', channel_id=channel.id) }}">{{ channel.name }}</a><div class="channel-id mono">{{ channel.id }}</div></div>
+    <div><div class="mode-badges">{% for key, label in [('public', 'Public'), ('unarchived', 'Unarchived'), ('members', 'Members'), ('community', 'Community')] %}{% if channel[key] %}<span class="mode-badge mode-{{ key }}">{{ label }}</span>{% endif %}{% endfor %}</div>{% if channel.title_regex or channel.description_regex %}<div class="rule-preview" title="{{ channel.title_regex or channel.description_regex }}">Filtered · <span class="mono">{{ channel.title_regex or channel.description_regex }}</span></div>{% endif %}</div>
+    <a class="button secondary small-button" href="{{ url_for('channel_editor', channel_id=channel.id) }}" aria-label="Edit {{ channel.name }}">Edit</a>
+</article>
+{% endfor %}
+<div class="list-footer"><span data-filter-count>{{ channels | length }} channels</span></div>
+<p class="filter-empty" hidden>No channels match your search.</p>
+{% else %}{% call empty('No channels yet', 'Add a YouTube channel link or handle and choose what to archive.') %}<a class="button primary" href="{{ url_for('channel_editor') }}">Add channel</a>{% endcall %}{% endif %}
+</section></div></div>
+{% endblock %}
