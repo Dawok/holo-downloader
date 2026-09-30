@@ -189,6 +189,7 @@ class WebUiTests(unittest.TestCase):
             self.web.init_db()
             self.assertEqual(self.web.get_history()[0]['video_id'], 'abcdefghijk')
             self.assertFalse(self.web.get_history()[0]['has_thumbnail'])
+            self.assertIsNone(self.web.get_history()[0]['error_message'])
             self.web.save_to_history('bcdefghijkl', {'status': 'Finished'}, info={'title': 'Recorded title', 'channel': 'Example channel'})
             self.assertEqual(self.web.get_history()[0]['title'], 'Recorded title')
             self.assertEqual(self.client.get('/data/history').status_code, 200)
@@ -302,7 +303,7 @@ class WebUiTests(unittest.TestCase):
         downloader = SimpleNamespace(
             config=SimpleNamespace(get_temp_folder=lambda: str(temp_root)),
             temp_output_dir=str(stream_folder),
-            livestream_downloader=SimpleNamespace(file_names={}),
+            livestream_downloader=SimpleNamespace(stats={}, file_names={}),
             main=Mock(side_effect=RuntimeError('Download failed')),
         )
         self.web.active_downloads['abcdefghijk'] = {'downloader': downloader, 'remove_requested': True}
@@ -312,6 +313,47 @@ class WebUiTests(unittest.TestCase):
         self.assertFalse(stream_folder.exists())
         self.assertNotIn('abcdefghijk', self.web.active_downloads)
         self.assertFalse(self.web.get_history())
+
+    def test_failed_streams_show_escaped_error_details_and_can_be_scanned_again(self):
+        message = 'DownloadError: <script>alert(1)</script> requested format is not available'
+        downloader = SimpleNamespace(
+            info_dict={'title': 'Failed stream'}, embed_info={}, main=Mock(),
+            livestream_downloader=SimpleNamespace(stats={'status': 'Error', 'error_message': message}),
+        )
+        self.web.active_downloads['abcdefghijk'] = {'downloader': downloader, 'type': 'stream'}
+        self.web.thread_worker('abcdefghijk', downloader)
+        self.web.init_db()
+        row = self.web.get_history()[0]
+        self.assertEqual(row['status'], 'Error')
+        self.assertEqual(row['error_message'], message)
+        self.assertEqual(self.client.get('/api/history').json[0]['error_message'], message)
+        for route in ('/data/history', '/data/recent', '/activity'):
+            with self.subTest(route=route):
+                response = self.client.get(route)
+                self.assertIn(b'status-danger', response.data)
+                self.assertIn(b'<details class="history-error">', response.data)
+                self.assertIn(b'&lt;script&gt;', response.data)
+                self.assertNotIn(b'<script>alert(1)', response.data)
+        self.assertNotIn('abcdefghijk', self.web.active_downloads)
+        self.assertFalse(self.web.is_stream_removed('abcdefghijk'))
+        with patch.object(self.web.downloadVid, 'VideoDownloader', return_value=downloader, create=True), \
+                patch.object(self.web.threading, 'Thread', return_value=Mock()):
+            self.assertTrue(self.web.start_download('abcdefghijk'))
+
+    def test_uncaught_download_errors_are_saved_in_history_and_clear_the_active_job(self):
+        downloader = SimpleNamespace(
+            info_dict={}, embed_info={},
+            main=Mock(side_effect=RuntimeError('Extraction failed')),
+            livestream_downloader=SimpleNamespace(stats={'status': 'Waiting'}),
+        )
+        self.web.active_downloads['abcdefghijk'] = {'downloader': downloader, 'type': 'stream'}
+        with self.assertLogs(self.web.common.logger, level='ERROR'):
+            self.web.thread_worker('abcdefghijk', downloader)
+        row = self.web.get_history()[0]
+        self.assertEqual(row['status'], 'Error')
+        self.assertEqual(row['error_message'], 'RuntimeError: Extraction failed')
+        self.assertNotIn('abcdefghijk', self.web.active_downloads)
+        self.assertFalse(self.web.is_stream_removed('abcdefghijk'))
 
     def test_remove_still_cancels_when_blacklist_storage_is_unavailable(self):
         downloader = SimpleNamespace(kill_this=threading.Event())

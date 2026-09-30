@@ -143,6 +143,11 @@ th.num, td.num { text-align: right; font-family: var(--mono); font-variant-numer
 .video-info { min-width: 0; max-width: 350px; line-height: 1.35; }
 .video-info > a { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; font-weight: 550; }
 .video-info small, time small { display: block; color: var(--subtle); font-size: 12px; margin-top: 2px; }
+.history-error { margin-top: 6px; max-width: 280px; }
+.history-error[open] { min-width: 240px; }
+.history-error summary { color: var(--muted); cursor: pointer; font-size: 12px; }
+.history-error summary:hover { color: var(--text); }
+.history-error pre { margin: 8px 0 0; color: var(--danger); font: 12px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 time { white-space: nowrap; font-size: 12.5px; color: var(--muted); }
 .checker-name { font-weight: 550; white-space: nowrap; }
 .list-footer, .filter-empty { color: var(--subtle); font-size: 12.5px; padding: 12px 0; }

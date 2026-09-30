@@ -121,7 +121,8 @@ def init_db():
         ''')
         columns = {row[1] for row in conn.execute('PRAGMA table_info(history)')}
         for column, column_type in (('title', 'TEXT'), ('channel', 'TEXT'),
-                                    ('thumbnail', 'BLOB'), ('thumbnail_mime_type', 'TEXT')):
+                                    ('thumbnail', 'BLOB'), ('thumbnail_mime_type', 'TEXT'),
+                                    ('error_message', 'TEXT')):
             if column not in columns:
                 conn.execute(f'ALTER TABLE history ADD COLUMN {column} {column_type}')
         conn.execute('''
@@ -166,12 +167,12 @@ def save_to_history(video_id, stats, download_type="Unknown", info=None, thumbna
 
         info = info or {}
         c.execute('''INSERT INTO history
-                     (video_id, type, total_size, status, title, channel, thumbnail, thumbnail_mime_type)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                     (video_id, type, total_size, status, title, channel, thumbnail, thumbnail_mime_type, error_message)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                   (video_id, download_type, download_size, stats.get("status", None),
                    info.get('fulltitle') or info.get('title'),
                    info.get('channel') or info.get('uploader') or info.get('author_name'),
-                   thumbnail, thumbnail_mime_type))
+                   thumbnail, thumbnail_mime_type, stats.get('error_message')))
         
         # Cleanup old history
         c.execute('''
@@ -186,7 +187,7 @@ def get_history():
         conn.row_factory = sqlite3.Row
         # We execute directly on the connection for brevity
         rows = conn.execute('''SELECT id, video_id, type, status, total_size, timestamp, title, channel,
-                               thumbnail IS NOT NULL AS has_thumbnail
+                               thumbnail IS NOT NULL AS has_thumbnail, error_message
                                FROM history ORDER BY id DESC''').fetchall()
         return rows
 
@@ -320,7 +321,13 @@ def thread_worker(video_id, downloader, thread_tracker: dict = active_downloads)
     global recently_finished
     remove_requested = False
     try:
-        downloader.main()
+        try:
+            downloader.main()
+        except Exception as error:
+            stats = downloader.livestream_downloader.stats
+            stats['status'] = 'Error'
+            stats['error_message'] = f'{type(error).__name__}: {error}'
+            common.logger.exception("Error downloading %s", video_id)
         with LOCK:
             entry = thread_tracker.get(video_id)
             owns_entry = entry is not None and entry.get('downloader') is downloader

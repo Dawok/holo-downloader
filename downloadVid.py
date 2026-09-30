@@ -119,6 +119,7 @@ class VideoDownloader():
         except Exception as e:
             self.logger.exception("Error occured {0}".format(self.id))
             self.livestream_downloader.stats["status"] = "Error"
+            self.livestream_downloader.stats["error_message"] = f"{type(e).__name__}: {e}"
             sleep(1.0)
             raise Exception(("{3} - Error downloading video: {0}, {1}: {2}".format(self.id, type(e).__name__, e, asctime())))
         finally:
@@ -149,6 +150,7 @@ class VideoDownloader():
                 raise InterruptedError("Download was removed")
             additional_ytdlp_options = json.loads(self.config.get_ytdlp_options() or "{}")
             additional_ytdlp_options.setdefault("socket_timeout", 30)
+            additional_ytdlp_options["logger"] = self.logger
             info_dict, live_status = getUrls.get_Video_Info(
                 id=video_url,
                 wait=False,
@@ -222,6 +224,8 @@ class VideoDownloader():
                     self.livestream_downloader.stats["status"] = "Cancelled"
                     self.logger.info("Download of %s was removed", self.id)
                     return
+                self.livestream_downloader.stats["status"] = "Error"
+                self.livestream_downloader.stats.setdefault("error_message", f"{type(e).__name__}: {e}")
                 self.logger.exception("Error downloading video")
                 # Pass config for error notification
                 discord_web.main(self.id, "error", message=f"{type(e).__name__}: {str(e)}"[-500:], config=self.config)
