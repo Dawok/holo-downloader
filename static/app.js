@@ -1,9 +1,27 @@
 const csrfToken = document.querySelector('meta[name="csrf-token"]').content;
+const scheduledTimeFormatter = new Intl.DateTimeFormat(undefined, {
+    month: 'short', day: 'numeric', year: 'numeric',
+    hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+});
 
 function hideBrokenHistoryThumbnails(root) {
     for (const image of root.querySelectorAll('[data-history-thumbnail]')) {
         if (image.complete && image.naturalWidth === 0) image.hidden = true;
     }
+}
+
+function updateScheduledTimes(root = document) {
+    for (const time of root.querySelectorAll('[data-scheduled-start]')) {
+        const date = new Date(Number(time.dataset.scheduledStart) * 1000);
+        if (!Number.isNaN(date.valueOf())) time.textContent = `Scheduled for ${scheduledTimeFormatter.format(date)}`;
+    }
+}
+
+function setDetailsExpanded(button, detail, expanded) {
+    detail.hidden = !expanded;
+    button.setAttribute('aria-expanded', String(expanded));
+    button.setAttribute('aria-label', `${expanded ? 'Hide' : 'Show'} details for ${button.dataset.detailsLabel}`);
+    button.title = `${expanded ? 'Hide' : 'Show'} details`;
 }
 
 document.addEventListener('error', event => {
@@ -12,6 +30,7 @@ document.addEventListener('error', event => {
     }
 }, true);
 hideBrokenHistoryThumbnails(document);
+updateScheduledTimes();
 
 function filterItems(scope) {
     const query = (scope.querySelector('[data-filter-search]')?.value || '').trim().toLocaleLowerCase();
@@ -73,9 +92,10 @@ for (const container of document.querySelectorAll('[data-poll]')) {
             if (!isBusy()) {
                 container.innerHTML = html;
                 hideBrokenHistoryThumbnails(container);
+                updateScheduledTimes(container);
                 for (const detail of container.querySelectorAll('[data-job]')) {
-                    detail.hidden = !openDetails.has(detail.dataset.job);
-                    container.querySelector(`[data-toggle-details="${detail.dataset.job}"]`).setAttribute('aria-expanded', String(!detail.hidden));
+                    const toggle = container.querySelector(`[data-toggle-details="${detail.dataset.job}"]`);
+                    if (toggle) setDetailsExpanded(toggle, detail, openDetails.has(detail.dataset.job));
                 }
             }
             updateCounters(container);
@@ -97,8 +117,7 @@ document.addEventListener('click', event => {
     const toggle = event.target.closest('[data-toggle-details]');
     if (toggle) {
         const detail = document.getElementById(toggle.dataset.toggleDetails);
-        detail.hidden = !detail.hidden;
-        toggle.setAttribute('aria-expanded', String(!detail.hidden));
+        setDetailsExpanded(toggle, detail, detail.hidden);
     }
     const closer = event.target.closest('[data-close-dialog]');
     if (closer) closer.closest('dialog').close();

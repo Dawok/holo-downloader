@@ -98,7 +98,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .stream-waiting { color: var(--subtle); font-size: 13px; }
 .stream-list { border-bottom: 1px solid var(--border); }
 .stream-list:has(.empty-state) { border: 0; }
-.stream-row { display: grid; grid-template-columns: 172px minmax(0,1fr) 140px 180px 68px; grid-template-areas: 'thumb who elapsed size controls' 'details details details details details'; align-items: center; gap: 8px 22px; padding: 16px 0; border-top: 1px solid var(--border); }
+.stream-row { position: relative; display: grid; grid-template-columns: 172px minmax(0,1fr) 140px 180px 68px; grid-template-areas: 'thumb who elapsed size controls' 'details details details details details'; align-items: center; gap: 8px 22px; padding: 16px 0 54px; border-top: 1px solid var(--border); }
 .stream-image { grid-area: thumb; display: block; position: relative; aspect-ratio: 16/9; border-radius: 8px; overflow: hidden; background: var(--raised); border: 1px solid var(--border); }
 .stream-image img, .mini-image img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .record-dot { position: absolute; top: 8px; left: 8px; width: 10px; height: 10px; border-radius: 50%; background: var(--subtle); border: 2px solid #0005; }
@@ -119,13 +119,20 @@ textarea { resize: vertical; line-height: 1.5; }
 .stream-elapsed > span, .stream-size > span { display: block; font-size: 12.5px; color: var(--subtle); margin-top: 2px; }
 .stream-size { grid-area: size; }
 .stream-size strong { display: block; font-weight: 600; font-size: 15px; margin-bottom: 4px; }
-.stream-controls { grid-area: controls; display: flex; flex-direction: column; gap: 6px; }
-.stream-controls .button { width: 100%; }
+.stream-controls { grid-area: controls; display: flex; flex-direction: column; align-self: start; gap: 6px; }
+.stream-controls form .button { width: 40px; height: 40px; border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border)); border-radius: 10px; background: color-mix(in srgb, var(--danger) 8%, var(--surface)); }
+.stream-controls form .button:hover { border-color: color-mix(in srgb, var(--danger) 70%, var(--border)); background: color-mix(in srgb, var(--danger) 14%, var(--surface)); }
 .stream-controls form { display: flex; justify-content: flex-end; }
-.stream-controls form .button { width: 34px; }
 .stream-details { grid-area: details; padding: 12px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--muted); font: 12px/1.55 var(--mono); }
 .stream-details dl { margin: 0; display: flex; flex-wrap: wrap; gap: 12px 34px; }
 .stream-details dd { margin: 0; color: var(--text); }
+.stream-details-toggle { position: absolute; right: 0; bottom: 7px; display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); color: var(--muted); transition: color 140ms ease-out, background-color 140ms ease-out, border-color 140ms ease-out; }
+.stream-details-toggle:hover { border-color: var(--subtle); background: var(--raised); color: var(--text); }
+.stream-details-toggle:active { scale: .96; }
+.stream-details-toggle svg { transition: transform 160ms ease-out; }
+.stream-details-toggle[aria-expanded='true'] { color: var(--accent); }
+.stream-details-toggle[aria-expanded='true'] svg { transform: rotate(180deg); }
+@media (prefers-reduced-motion: reduce) { .stream-details-toggle, .stream-details-toggle svg { transition: none; } }
 .empty-state { border: 1px dashed var(--border); border-radius: 12px; text-align: center; padding: 30px 24px; margin-top: 12px; }
 .empty-state p { margin: 4px auto 0; color: var(--muted); max-width: 52ch; }
 .empty-state .button { margin-top: 14px; }
@@ -220,6 +227,7 @@ input[role='switch']:checked::before { transform: translateX(18px); background: 
 @media (max-width: 900px) {
     .stream-row { grid-template-columns: 120px minmax(0,1fr); grid-template-areas: 'thumb who' 'elapsed size' 'controls controls' 'details details'; gap: 14px 20px; }
     .stream-controls { flex-direction: row; }
+    .stream-controls form .button { width: 44px; height: 44px; }
     .stream-controls .button { width: auto; }
     .stream-size strong { margin-bottom: 2px; }
     .settings-layout { grid-template-columns: 1fr; gap: 24px; }

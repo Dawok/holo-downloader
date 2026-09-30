@@ -219,7 +219,9 @@ def get_download_metadata(downloader):
     return {
         'fulltitle': info.get('fulltitle'),
         'title': info.get('title') or embed.get('title'),
-        'channel': info.get('channel') or info.get('uploader') or embed.get('author_name')
+        'channel': info.get('channel') or info.get('uploader') or embed.get('author_name'),
+        'release_timestamp': info.get('release_timestamp'),
+        'live_status': info.get('live_status')
     }
 
 def get_download_thumbnail(downloader):
@@ -544,11 +546,22 @@ def get_active_jobs_data():
             stats = downloader.livestream_downloader.stats
             status = str(stats.get('status') or '').strip().lower()
             is_waiting = status.startswith('waiting')
+            is_recording = status == 'recording'
             if status == 'recording' and job.get('recording_start_time') is None:
                 job['recording_start_time'] = datetime.now()
             recording_start_time = job.get('recording_start_time')
             timer_start = recording_start_time if not is_waiting else None
             display_start = timer_start or job['start_time']
+
+            scheduled_timestamp = None
+            scheduled_start = None
+            if is_waiting and display_info.get('release_timestamp') is not None:
+                try:
+                    scheduled_timestamp = float(display_info['release_timestamp'])
+                    scheduled_at = datetime.fromtimestamp(scheduled_timestamp).astimezone()
+                    scheduled_start = scheduled_at.strftime('%b %d, %Y at %I:%M %p %Z').replace(' 0', ' ')
+                except (OverflowError, OSError, TypeError, ValueError):
+                    scheduled_timestamp = None
 
             current_jobs.append({
                 'id': vid,
@@ -557,8 +570,18 @@ def get_active_jobs_data():
                 'start_time': display_start.strftime('%H:%M:%S'),
                 'start_timestamp': timer_start.timestamp() if timer_start else None,
                 'elapsed': elapsed_time(timer_start) if timer_start else None,
-                'is_waiting': is_waiting
+                'is_waiting': is_waiting,
+                'is_recording': is_recording,
+                'queued_timestamp': job['start_time'].timestamp(),
+                'scheduled_timestamp': scheduled_timestamp,
+                'scheduled_start': scheduled_start
             })
+    current_jobs.sort(key=lambda job: (
+        0 if job['is_recording'] else 1 if job['is_waiting'] else 2,
+        -job['start_timestamp'] if job['is_recording'] else (
+            job['scheduled_timestamp'] if job['is_waiting'] and job['scheduled_timestamp'] is not None
+            else float('inf') if job['is_waiting'] else job['queued_timestamp']),
+        job['id']))
     return current_jobs
 
 def get_active_unarchived_jobs_data():
