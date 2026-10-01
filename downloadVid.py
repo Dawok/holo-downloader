@@ -6,7 +6,7 @@ from getConfig import ConfigHandler
 from pathlib import Path
 
 import discord_web
-from time import sleep, asctime, time
+from time import sleep, asctime, time, monotonic
 from random import uniform
 # Import FileLock, setup_umask, AND the shared kill_all event from common
 from common import FileLock, setup_umask, kill_all, initialize_logging
@@ -49,6 +49,7 @@ class VideoDownloader():
             raise ValueError("No video ID provided, unable to continue")
         
         self.kill_this: threading.Event = kill_this or threading.Event()
+        self.check_now = threading.Event()
 
         if config is None:
             config = ConfigHandler()
@@ -136,6 +137,22 @@ class VideoDownloader():
         discord_web.main(id=self.id, status="done", config=self.config)
         return
 
+    def request_live_check(self) -> bool:
+        status = str(self.livestream_downloader.stats.get('status') or '').strip().lower()
+        if self.kill_this.is_set() or (status and not status.startswith('waiting')):
+            return False
+        self.check_now.set()
+        return True
+
+    def _wait_for_live_check(self, timeout: float) -> None:
+        deadline = monotonic() + timeout
+        while not self.kill_this.is_set():
+            remaining = deadline - monotonic()
+            # Cancellation can also be signalled without a manual-check request.
+            if remaining <= 0 or self.check_now.wait(min(remaining, 1.0)):
+                return
+        raise InterruptedError("Download was removed")
+
     def download_video_info(self, video_url: str) -> Tuple[str, Dict[str, Any]]:
         """
         Fetches video metadata and prepares the output file template.
@@ -154,6 +171,8 @@ class VideoDownloader():
         while True:
             if self.kill_this.is_set():
                 raise InterruptedError("Download was removed")
+            # Requests received during extraction must still wake the next wait.
+            self.check_now.clear()
             additional_ytdlp_options = json.loads(self.config.get_ytdlp_options() or "{}")
             additional_ytdlp_options.setdefault("socket_timeout", 30)
             additional_ytdlp_options["logger"] = self.logger
@@ -186,8 +205,7 @@ class VideoDownloader():
             release_timestamp = info_dict.get("release_timestamp")
             wait_seconds = (release_timestamp - time() if release_timestamp is not None
                             else uniform(60, max_wait))
-            if self.kill_this.wait(min(max(wait_seconds, 60), max_wait)):
-                raise InterruptedError("Download was removed")
+            self._wait_for_live_check(min(max(wait_seconds, 60), max_wait))
 
         with yt_dlp.YoutubeDL(options) as ydl:
             outputFile = str(ydl.prepare_filename(info_dict)).replace("%", "％")

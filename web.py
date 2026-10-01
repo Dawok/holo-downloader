@@ -765,11 +765,22 @@ def manual_add():
             flash(f"Started download for {video_id}", "success")
         else:
             with LOCK:
-                removing = active_downloads.get(video_id, {}).get('remove_requested', False)
+                entry = active_downloads.get(video_id, {})
+                removing = entry.get('remove_requested', False)
+                downloader = entry.get('downloader')
+                check_requested = (downloader is not None and not removing
+                                   and not entry.get('worker_finished')
+                                   and downloader.request_live_check())
+                recording = (downloader is not None
+                             and str(downloader.livestream_downloader.stats.get('status') or '').strip().lower() == 'recording')
             if removing:
                 flash(f"Video {video_id} is being removed. Try adding it again after cleanup finishes.", "warning")
+            elif check_requested:
+                flash(f"Stream {video_id} is already added and waiting to start. Checking whether it is live now.", "success")
+            elif recording:
+                flash(f"Video {video_id} is already recording.", "warning")
             else:
-                flash(f"Video {video_id} is already being downloaded.", "warning")
+                flash(f"Video {video_id} is already in progress.", "warning")
     return redirect(url_for('index'))
 
 @app.route('/config', methods=['GET', 'POST'])

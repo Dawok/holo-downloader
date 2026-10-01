@@ -580,6 +580,44 @@ class WebUiTests(unittest.TestCase):
         self.assertEqual(response.json, {'theme': 'dark'})
         self.assertEqual(self.post('/actions/toggle_theme', return_to='//example.com').location, '/')
 
+    def test_manual_add_rechecks_waiting_job_without_starting_another_download(self):
+        downloader = SimpleNamespace(
+            kill_this=threading.Event(), request_live_check=Mock(return_value=True),
+            livestream_downloader=SimpleNamespace(stats={'status': 'Waiting'}),
+        )
+        self.web.active_downloads['abcdefghijk'] = {'downloader': downloader}
+        with patch.object(self.web.downloadVid, 'VideoDownloader', create=True) as create, \
+                patch.object(self.web.threading, 'Thread') as thread:
+            self.assertEqual(self.post('/actions/add', video_id='https://youtu.be/abcdefghijk').status_code, 302)
+            create.assert_not_called()
+            thread.assert_not_called()
+        downloader.request_live_check.assert_called_once_with()
+        self.assertIs(self.web.active_downloads['abcdefghijk']['downloader'], downloader)
+        self.assertFalse(downloader.kill_this.is_set())
+        with self.client.session_transaction() as session:
+            category, message = session['_flashes'][-1]
+            self.assertEqual(category, 'success')
+            self.assertIn('Checking whether abcdefghijk is live now', message)
+
+    def test_manual_add_keeps_recording_and_removing_jobs(self):
+        for removing in (False, True):
+            with self.subTest(removing=removing):
+                downloader = SimpleNamespace(
+                    request_live_check=Mock(return_value=False),
+                    livestream_downloader=SimpleNamespace(stats={'status': 'Recording'}),
+                )
+                self.web.active_downloads['abcdefghijk'] = {
+                    'downloader': downloader, 'remove_requested': removing,
+                }
+                with patch.object(self.web.downloadVid, 'VideoDownloader', create=True) as create:
+                    self.assertEqual(self.post('/actions/add', video_id='abcdefghijk').status_code, 302)
+                    create.assert_not_called()
+                if removing:
+                    downloader.request_live_check.assert_not_called()
+                with self.client.session_transaction() as session:
+                    message = session['_flashes'][-1][1]
+                    self.assertIn('being removed' if removing else 'already recording', message)
+
     def test_invalid_manual_video_does_not_start_download(self):
         with patch.object(self.web, 'start_download') as start:
             self.assertEqual(self.post('/actions/add', video_id='invalid').status_code, 302)

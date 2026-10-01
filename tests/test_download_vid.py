@@ -42,6 +42,7 @@ class DownloadVidTests(unittest.TestCase):
         self.downloader.info_dict = {}
         self.downloader.logger = logging.getLogger('download-vid-tests')
         self.downloader.kill_this = threading.Event()
+        self.downloader.check_now = threading.Event()
         self.downloader.livestream_downloader = SimpleNamespace(stats={})
         self.downloader.downloader = Mock()
         self.downloader.config = SimpleNamespace(
@@ -60,32 +61,127 @@ class DownloadVidTests(unittest.TestCase):
         self.module.discord_web.main.reset_mock()
 
     def test_upcoming_stream_keeps_waiting_across_maximum_polling_intervals(self):
-        self.downloader.kill_this = Mock(is_set=Mock(return_value=False), wait=Mock(return_value=False))
         responses = [(self.upcoming, 'is_upcoming'), (self.upcoming, 'is_upcoming'), (self.live, 'is_live')]
         with patch.object(self.module.getUrls, 'get_Video_Info', side_effect=responses) as extract, \
+                patch.object(self.downloader, '_wait_for_live_check') as wait, \
                 patch.object(self.module, 'time', side_effect=[0, 900]):
             output, info = self.downloader.download_video_info('abcdefghijk')
         self.assertEqual(output, 'Live stream.mp4')
         self.assertIs(info, self.live)
         self.assertEqual(extract.call_count, 3)
-        self.downloader.kill_this.wait.assert_has_calls([call(900), call(900)])
+        wait.assert_has_calls([call(900), call(900)])
         self.assertTrue(all(arguments.kwargs['wait'] is False for arguments in extract.call_args_list))
 
     def test_upcoming_polling_interval_respects_the_scheduled_start_and_bounds(self):
         for release_timestamp, expected_wait in ((30, 60), (120, 120), (3600, 900), (None, 300)):
             with self.subTest(release_timestamp=release_timestamp):
-                self.downloader.kill_this = Mock(is_set=Mock(return_value=False), wait=Mock(return_value=False))
                 upcoming = {**self.upcoming, 'release_timestamp': release_timestamp}
                 with patch.object(self.module.getUrls, 'get_Video_Info',
                                   side_effect=[(upcoming, 'is_upcoming'), (self.live, 'is_live')]), \
+                        patch.object(self.downloader, '_wait_for_live_check') as wait, \
                         patch.object(self.module, 'time', return_value=0), \
                         patch.object(self.module, 'uniform', return_value=300):
                     self.downloader.download_video_info('abcdefghijk')
-                self.downloader.kill_this.wait.assert_called_once_with(expected_wait)
+                wait.assert_called_once_with(expected_wait)
+
+    def test_manual_check_wakes_waiting_job_and_starts_recording_when_live(self):
+        waiting = threading.Event()
+        original_wait = self.downloader.check_now.wait
+
+        def wait(timeout):
+            waiting.set()
+            return original_wait(timeout)
+
+        worker = threading.Thread(target=self.downloader.main, daemon=True)
+        try:
+            with patch.object(self.module.getUrls, 'get_Video_Info',
+                              side_effect=[(self.upcoming, 'is_upcoming'), (self.live, 'is_live')]) as extract, \
+                    patch.object(self.downloader.check_now, 'wait', side_effect=wait):
+                worker.start()
+                self.assertTrue(waiting.wait(2))
+                self.assertTrue(self.downloader.request_live_check())
+                worker.join(2)
+                self.assertFalse(worker.is_alive())
+            self.assertEqual(extract.call_count, 2)
+            self.downloader.downloader.assert_called_once_with(self.live)
+            self.assertFalse(self.downloader.kill_this.is_set())
+        finally:
+            self.downloader.kill_this.set()
+            self.downloader.check_now.set()
+            worker.join(2)
+
+    def test_manual_check_during_metadata_lookup_is_not_lost(self):
+        looking_up = threading.Event()
+        finish_lookup = threading.Event()
+
+        def extract(**kwargs):
+            if not looking_up.is_set():
+                looking_up.set()
+                if not finish_lookup.wait(2):
+                    raise TimeoutError('Metadata lookup was not released')
+                return self.upcoming, 'is_upcoming'
+            return self.live, 'is_live'
+
+        worker = threading.Thread(target=self.downloader.main, daemon=True)
+        try:
+            with patch.object(self.module.getUrls, 'get_Video_Info', side_effect=extract) as lookup:
+                worker.start()
+                self.assertTrue(looking_up.wait(2))
+                self.assertTrue(self.downloader.request_live_check())
+                finish_lookup.set()
+                worker.join(2)
+                self.assertFalse(worker.is_alive())
+            self.assertEqual(lookup.call_count, 2)
+            self.downloader.downloader.assert_called_once_with(self.live)
+        finally:
+            self.downloader.kill_this.set()
+            self.downloader.check_now.set()
+            finish_lookup.set()
+            worker.join(2)
+
+    def test_manual_check_keeps_monitoring_when_stream_is_still_upcoming(self):
+        waiting = threading.Event()
+        waiting_again = threading.Event()
+        original_wait = self.downloader.check_now.wait
+
+        def wait(timeout):
+            (waiting if lookup.call_count == 1 else waiting_again).set()
+            return original_wait(timeout)
+
+        worker = threading.Thread(target=self.downloader.main, daemon=True)
+        try:
+            with patch.object(self.module.getUrls, 'get_Video_Info',
+                              return_value=(self.upcoming, 'is_upcoming')) as lookup, \
+                    patch.object(self.downloader.check_now, 'wait', side_effect=wait):
+                worker.start()
+                self.assertTrue(waiting.wait(2))
+                self.assertTrue(self.downloader.request_live_check())
+                self.assertTrue(waiting_again.wait(2))
+                self.assertEqual(lookup.call_count, 2)
+                self.assertTrue(worker.is_alive())
+                self.assertFalse(self.downloader.check_now.is_set())
+                self.downloader.downloader.assert_not_called()
+                self.downloader.kill_this.set()
+                self.downloader.check_now.set()
+                worker.join(2)
+                self.assertFalse(worker.is_alive())
+        finally:
+            self.downloader.kill_this.set()
+            self.downloader.check_now.set()
+            worker.join(2)
+
+    def test_manual_check_does_not_interrupt_recording_or_removed_jobs(self):
+        for status, cancelled in (('Recording', False), ('Muxing', False), ('Waiting', True)):
+            with self.subTest(status=status, cancelled=cancelled):
+                self.downloader.livestream_downloader.stats['status'] = status
+                if cancelled:
+                    self.downloader.kill_this.set()
+                self.assertFalse(self.downloader.request_live_check())
+                self.assertFalse(self.downloader.check_now.is_set())
 
     def test_remove_interrupts_a_waiting_stream_without_starting_recording(self):
         waiting = threading.Event()
-        original_wait = self.downloader.kill_this.wait
+        original_wait = self.downloader.check_now.wait
 
         def wait(timeout):
             waiting.set()
@@ -94,7 +190,7 @@ class DownloadVidTests(unittest.TestCase):
         worker = threading.Thread(target=self.downloader.main, daemon=True)
         try:
             with patch.object(self.module.getUrls, 'get_Video_Info', return_value=(self.upcoming, 'is_upcoming')), \
-                    patch.object(self.downloader.kill_this, 'wait', side_effect=wait):
+                    patch.object(self.downloader.check_now, 'wait', side_effect=wait):
                 worker.start()
                 self.assertTrue(waiting.wait(2))
                 self.downloader.kill_this.set()
@@ -139,7 +235,7 @@ class DownloadVidTests(unittest.TestCase):
 
         with patch.object(self.module, 'getUrls', dependency_get_urls), \
                 patch.object(yt_dlp.YoutubeDL, 'extract_info', extract), \
-                patch.object(self.downloader.kill_this, 'wait', side_effect=remove), \
+                patch.object(self.downloader, '_wait_for_live_check', side_effect=remove), \
                 self.assertLogs(self.downloader.logger, level='WARNING'):
             with self.assertRaises(InterruptedError):
                 self.downloader.download_video_info('abcdefghijk')
@@ -159,7 +255,7 @@ class DownloadVidTests(unittest.TestCase):
 
         with patch.object(self.module, 'getUrls', dependency_get_urls), \
                 patch.object(yt_dlp.YoutubeDL, 'extract_info', extract), \
-                patch.object(self.downloader.kill_this, 'wait', return_value=False) as wait, \
+                patch.object(self.downloader, '_wait_for_live_check') as wait, \
                 self.assertLogs(self.downloader.logger, level='WARNING'):
             output, info = self.downloader.download_video_info('abcdefghijk')
         self.assertTrue(output.startswith('Live stream'))
