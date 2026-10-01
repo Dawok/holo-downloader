@@ -98,7 +98,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .stream-waiting { color: var(--subtle); font-size: 13px; }
 .stream-list { border-bottom: 1px solid var(--border); }
 .stream-list:has(.empty-state) { border: 0; }
-.stream-row { display: grid; grid-template-columns: 172px minmax(0,1fr) 140px 240px 68px; grid-template-areas: 'thumb who elapsed size controls'; align-items: center; gap: 8px 22px; padding: 16px 0; border-top: 1px solid var(--border); }
+.stream-row { display: grid; grid-template-columns: 172px minmax(0,1fr) 180px 240px 68px; grid-template-areas: 'thumb who timing size controls'; align-items: center; gap: 8px 22px; padding: 16px 0; border-top: 1px solid var(--border); }
 .stream-image { grid-area: thumb; display: block; position: relative; aspect-ratio: 16/9; border-radius: 8px; overflow: hidden; background: var(--raised); border: 1px solid var(--border); }
 .stream-image img, .mini-image img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .record-dot { position: absolute; top: 8px; left: 8px; width: 10px; height: 10px; border-radius: 50%; background: var(--subtle); border: 2px solid #0005; }
@@ -114,9 +114,10 @@ textarea { resize: vertical; line-height: 1.5; }
 [data-state='recording'] .status { color: var(--recording); }
 .status-danger { color: var(--danger); }
 .status-warning { color: var(--warning); }
-.stream-elapsed { grid-area: elapsed; }
-.stream-elapsed strong { display: block; font-size: 26px; font-weight: 600; line-height: 1.1; }
-.stream-elapsed > span { display: block; font-size: 12.5px; color: var(--subtle); margin-top: 2px; }
+.stream-time { grid-area: timing; min-width: 0; }
+.stream-time > span { display: block; font-size: 12.5px; color: var(--subtle); margin-bottom: 3px; }
+.stream-time > time { display: block; font-size: 14.5px; font-weight: 600; line-height: 1.4; white-space: normal; font-variant-numeric: tabular-nums; color: var(--text); }
+.stream-time > time small { font-weight: 400; }
 .stream-size { grid-area: size; }
 .stream-size strong { display: block; font-weight: 600; font-size: 15px; margin-bottom: 4px; }
 .stream-size-track { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-top: 2px; color: var(--subtle); font-size: 12.5px; }
@@ -219,7 +220,7 @@ input[role='switch']:checked::before { transform: translateX(18px); background: 
     .settings-nav { top: 20px; }
 }
 @media (max-width: 1000px) {
-    .stream-row { grid-template-columns: 120px minmax(0,1fr); grid-template-areas: 'thumb who' 'elapsed size' 'controls controls'; gap: 14px 20px; }
+    .stream-row { grid-template-columns: 120px minmax(0,1fr); grid-template-areas: 'thumb who' 'timing size' 'controls controls'; gap: 14px 20px; }
     .stream-controls { flex-direction: row; }
     .stream-controls form { justify-content: center; }
     .stream-controls form .button { width: 44px; height: 44px; }
@@ -241,7 +242,6 @@ input[role='switch']:checked::before { transform: translateX(18px); background: 
     .metrics { gap: 16px 28px; }
     .stream-row { grid-template-columns: 100px minmax(0,1fr); gap: 14px; }
     .stream-title { font-size: 14px; }
-    .stream-elapsed strong { font-size: 21px; }
     .stream-size-track { flex-wrap: wrap; column-gap: 6px; }
     .channel-row { grid-template-columns: minmax(0,1fr) auto; gap: 10px; }
     .channel-row > :nth-child(2) { grid-column: 1 / -1; grid-row: 2; }

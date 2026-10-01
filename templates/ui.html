@@ -13,6 +13,12 @@
 
 {% macro badge(status) -%}<span class="status status-{{ status | status_class }}"><span class="status-dot"></span>{{ status or 'Unknown' }}</span>{%- endmacro %}
 
+{% macro formatted_time(value) -%}
+{% set displayed = value | app_datetime %}
+{% if displayed %}<time datetime="{{ displayed.isoformat() }}" title="{{ displayed.strftime('%b %d, %Y at %H:%M:%S %Z') }}">{{ displayed.strftime('%H:%M %Z') }}<small>{{ displayed.strftime('%b %d, %Y').replace(' 0', ' ') }}</small></time>
+{% else %}<time>{{ value }}</time>{% endif %}
+{%- endmacro %}
+
 {% macro empty(title, description) -%}
 <div class="empty-state"><h3>{{ title }}</h3><p>{{ description }}</p>{{ caller() if caller is defined else '' }}</div>
 {%- endmacro %}
@@ -30,8 +36,12 @@
 {% set video_size = video.get('current_filesize') or 0 %}{% set audio_size = audio.get('current_filesize') or 0 %}
 <article class="stream-row filter-item" data-search="{{ title }} {{ job.id }} {{ job.info.get('channel') or '' }}" data-state="{{ status | lower }}" data-size="{{ video_size + audio_size }}">
     <a class="stream-image" href="https://www.youtube.com/watch?v={{ job.id }}" target="_blank" rel="noopener noreferrer" aria-label="Watch {{ title }} on YouTube"><img src="https://i.ytimg.com/vi/{{ job.id }}/mqdefault.jpg" alt="" loading="lazy" width="160" height="90"><span class="record-dot {{ 'live' if status | lower == 'recording' }}" aria-hidden="true"></span></a>
-    <div class="stream-main"><a class="stream-title" href="https://www.youtube.com/watch?v={{ job.id }}" target="_blank" rel="noopener noreferrer">{{ title }}</a><div class="subline">{% if job.info.get('channel') %}<span>{{ job.info.channel }}</span>{% endif %}<span class="mono">{{ job.id }}</span>{% if job.is_waiting and job.scheduled_start %}<span data-scheduled-start="{{ job.scheduled_timestamp }}">Scheduled for {{ job.scheduled_start }}</span>{% elif not job.is_waiting %}<span>Started {{ job.start_time }}</span>{% endif %}</div><div class="stream-badges">{{ badge(status) }}{% if monitoring %}<span class="mode-badge">Unarchived</span>{% endif %}</div></div>
-    {% if job.elapsed is not none %}<div class="stream-elapsed"><strong class="mono" data-started="{{ job.start_timestamp }}">{{ job.elapsed }}</strong><span>running time</span></div>{% elif job.is_waiting %}<div class="stream-elapsed stream-waiting">Waiting for stream</div>{% endif %}
+    <div class="stream-main"><a class="stream-title" href="https://www.youtube.com/watch?v={{ job.id }}" target="_blank" rel="noopener noreferrer">{{ title }}</a><div class="subline">{% if job.info.get('channel') %}<span>{{ job.info.channel }}</span>{% endif %}<span class="mono">{{ job.id }}</span></div><div class="stream-badges">{{ badge(status) }}{% if monitoring %}<span class="mode-badge">Unarchived</span>{% endif %}</div></div>
+    <div class="stream-time">
+        {% if job.is_waiting and job.scheduled_datetime %}<span>Scheduled for</span>{{ formatted_time(job.scheduled_datetime) }}
+        {% elif job.is_waiting %}<span class="stream-waiting">Waiting for stream</span>
+        {% else %}<span>Started at</span>{{ formatted_time(job.start_datetime) }}{% endif %}
+    </div>
     <div class="stream-size"><strong class="mono">{{ (video_size + audio_size) | convert_bytes }}</strong><div class="stream-size-track"><span>Video {{ video_size | convert_bytes }}</span><span>{{ video.get('downloaded_segments') or 0 }} fragments</span></div><div class="stream-size-track"><span>Audio {{ audio_size | convert_bytes }}</span><span>{{ audio.get('downloaded_segments') or 0 }} fragments</span></div></div>
     <div class="stream-controls"><form action="{{ url_for('cancel_unarchived' if monitoring else 'cancel_download', video_id=job.id) }}" method="post" data-confirm="{{ 'Stop monitoring ' ~ title ~ '?' if monitoring else 'Remove ' ~ title ~ ' and discard its temporary recording files?' }}">{{ csrf() }}<button class="button danger-outline small-button icon-button" type="submit" aria-label="{{ 'Stop monitoring ' ~ title if monitoring else 'Remove ' ~ title ~ ' and temporary files' }}" title="{{ 'Stop monitoring ' ~ title if monitoring else 'Remove ' ~ title }}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2m-9 0 1 14h8l1-14M10 11v5m4-5v5"/></svg></button></form></div>
 </article>

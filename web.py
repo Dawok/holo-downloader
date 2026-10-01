@@ -8,9 +8,10 @@ import secrets
 import hmac
 import shutil
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from flask import Flask, abort, render_template, request, redirect, send_file, send_from_directory, url_for, flash, make_response, jsonify, session
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.job import Job
@@ -71,6 +72,26 @@ cache = Cache(app)
 GLOBAL_THEME = "dark"
 
 history_update_event = threading.Event()
+
+
+def get_display_timezone():
+    try:
+        return ZoneInfo(os.environ.get('TZ') or 'UTC')
+    except (ZoneInfoNotFoundError, ValueError):
+        return timezone.utc
+
+
+@app.template_filter('app_datetime')
+def app_datetime(value):
+    if not isinstance(value, datetime):
+        try:
+            value = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        except ValueError:
+            return None
+    # SQLite's CURRENT_TIMESTAMP is UTC without an offset.
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(get_display_timezone())
 
 
 @app.context_processor
@@ -391,8 +412,7 @@ def start_download(video_id, manual=False):
             'downloader': downloader,
             'thread': thread,
             'type': "stream",
-            'start_time': datetime.now(),
-            'recording_start_time': None
+            'start_time': datetime.now(timezone.utc)
         }
         
         thread.start()
@@ -410,7 +430,7 @@ def start_unarchived_download(video_id):
             'downloader': downloader,
             'thread': thread,
             'type': "unarchived",
-            'start_time': datetime.now()
+            'start_time': datetime.now(timezone.utc)
         }
         
         thread.start()
@@ -534,6 +554,29 @@ def update_scheduler():
 
 # --- Helper for HTMX Data Routes ---
 
+def get_job_timing(job, info, is_waiting=False):
+    """Read stream timestamps without starting a clock when the page is opened."""
+    released_at = None
+    if info.get('release_timestamp') is not None:
+        try:
+            released_at = datetime.fromtimestamp(float(info['release_timestamp']), timezone.utc)
+        except (OverflowError, OSError, TypeError, ValueError):
+            pass
+
+    queued_at = job['start_time']
+    started_at = None if is_waiting else (released_at or job.get('recording_start_time') or queued_at)
+    scheduled_at = released_at if is_waiting else None
+    date_format = '%b %d, %Y at %H:%M %Z'
+    return {
+        'start_time': (started_at or queued_at).astimezone(get_display_timezone()).strftime('%H:%M:%S'),
+        'start_timestamp': started_at.timestamp() if started_at else None,
+        'start_datetime': started_at.astimezone(timezone.utc).isoformat() if started_at else None,
+        'elapsed': elapsed_time(started_at) if started_at else None,
+        'scheduled_timestamp': scheduled_at.timestamp() if scheduled_at else None,
+        'scheduled_datetime': scheduled_at.isoformat() if scheduled_at else None,
+        'scheduled_start': scheduled_at.astimezone(get_display_timezone()).strftime(date_format).replace(' 0', ' ') if scheduled_at else None,
+    }
+
 def get_active_jobs_data():
     """Prepares active download data for display."""
     with LOCK:
@@ -547,34 +590,15 @@ def get_active_jobs_data():
             status = str(stats.get('status') or '').strip().lower()
             is_waiting = status.startswith('waiting')
             is_recording = status == 'recording'
-            if status == 'recording' and job.get('recording_start_time') is None:
-                job['recording_start_time'] = datetime.now()
-            recording_start_time = job.get('recording_start_time')
-            timer_start = recording_start_time if not is_waiting else None
-            display_start = timer_start or job['start_time']
-
-            scheduled_timestamp = None
-            scheduled_start = None
-            if is_waiting and display_info.get('release_timestamp') is not None:
-                try:
-                    scheduled_timestamp = float(display_info['release_timestamp'])
-                    scheduled_at = datetime.fromtimestamp(scheduled_timestamp).astimezone()
-                    scheduled_start = scheduled_at.strftime('%b %d, %Y at %I:%M %p %Z').replace(' 0', ' ')
-                except (OverflowError, OSError, TypeError, ValueError):
-                    scheduled_timestamp = None
 
             current_jobs.append({
                 'id': vid,
                 'stats': stats,
                 'info': display_info, # Pass the small dict, not the huge one
-                'start_time': display_start.strftime('%H:%M:%S'),
-                'start_timestamp': timer_start.timestamp() if timer_start else None,
-                'elapsed': elapsed_time(timer_start) if timer_start else None,
                 'is_waiting': is_waiting,
                 'is_recording': is_recording,
                 'queued_timestamp': job['start_time'].timestamp(),
-                'scheduled_timestamp': scheduled_timestamp,
-                'scheduled_start': scheduled_start
+                **get_job_timing(job, display_info, is_waiting),
             })
     current_jobs.sort(key=lambda job: (
         0 if job['is_recording'] else 1 if job['is_waiting'] else 2,
@@ -591,14 +615,17 @@ def get_active_unarchived_jobs_data():
         for vid, job in active_unarchived_downloads.copy().items():
             downloader: downloadVid.VideoDownloader = job['downloader']
             display_info = get_download_metadata(downloader)
+            stats = downloader.livestream_downloader.stats
+            status = str(stats.get('status') or '').strip().lower()
+            is_waiting = status.startswith('waiting')
 
             current_jobs.append({
                 'id': vid,
-                'stats': downloader.livestream_downloader.stats,
+                'stats': stats,
                 'info': display_info, # Pass the small dict, not the huge one
-                'start_time': job['start_time'].strftime('%H:%M:%S'),
-                'start_timestamp': job['start_time'].timestamp(),
-                'elapsed': elapsed_time(job['start_time'])
+                'is_waiting': is_waiting,
+                'is_recording': status == 'recording',
+                **get_job_timing(job, display_info, is_waiting),
             })
     return current_jobs
 

@@ -8,7 +8,7 @@ import sys
 import tempfile
 import threading
 from contextlib import closing
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -45,6 +45,9 @@ class WebUiTests(unittest.TestCase):
         cls.addClassCleanup(cls.web.scheduler.shutdown)
 
     def setUp(self):
+        timezone_patcher = patch.dict(os.environ, {'TZ': 'UTC'})
+        timezone_patcher.start()
+        self.addCleanup(timezone_patcher.stop)
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name) / 'config.toml'
@@ -204,8 +207,10 @@ class WebUiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b'&lt;script&gt;', response.data)
         self.assertNotIn(b'<script>alert(1)', response.data)
-        self.assertIn(b'02:00:', response.data)
-        self.assertIn('start_timestamp', self.client.get('/api/active').json[0])
+        self.assertIn(b'Started at', response.data)
+        self.assertNotIn(b'running time', response.data)
+        self.assertNotIn(b'data-started=', response.data)
+        self.assertEqual(self.client.get('/api/active').json[0]['start_timestamp'], started.timestamp())
         self.assertEqual(self.post('/actions/cancel/abcdefghijk').status_code, 302)
         self.assertTrue(downloader.kill_this.is_set())
         self.assertTrue(self.web.active_downloads['abcdefghijk']['remove_requested'])
@@ -238,8 +243,106 @@ class WebUiTests(unittest.TestCase):
         downloader.livestream_downloader.stats['status'] = 'Recording'
         recording_job = self.client.get('/api/active').json[0]
         self.assertFalse(recording_job['is_waiting'])
-        self.assertIsNotNone(recording_job['start_timestamp'])
-        self.assertEqual(recording_job['elapsed'], '00:00:00')
+        self.assertEqual(recording_job['start_timestamp'], self.web.active_downloads['abcdefghijk']['start_time'].timestamp())
+        self.assertIsNone(self.web.active_downloads['abcdefghijk']['recording_start_time'])
+        response = self.client.get('/data/active')
+        self.assertIn(b'Started at', response.data)
+        self.assertNotIn(b'running time', response.data)
+
+    def test_stream_start_comes_from_metadata_and_page_views_do_not_reset_it(self):
+        released_at = datetime(2026, 7, 1, 22, 30, tzinfo=timezone.utc)
+        for tracker, fragment, api in (
+                (self.web.active_downloads, '/data/active', '/api/active'),
+                (self.web.active_unarchived_downloads, '/data/unarchived', '/api/unarchived')):
+            with self.subTest(fragment=fragment):
+                downloader = SimpleNamespace(
+                    info_dict={'title': 'Live stream', 'release_timestamp': released_at.timestamp()},
+                    embed_info={}, livestream_downloader=SimpleNamespace(stats={'status': 'Recording'}))
+                entry = {'downloader': downloader, 'type': 'stream', 'start_time': datetime.now()}
+                tracker['abcdefghijk'] = entry
+                original = entry.copy()
+                for _ in range(2):
+                    self.client.get('/')
+                    response = self.client.get(fragment)
+                    self.assertIn(b'Started at', response.data)
+                    self.assertIn(b'datetime="2026-07-01T22:30:00+00:00"', response.data)
+                    self.assertNotIn(b'data-started=', response.data)
+                    self.assertEqual(self.client.get(api).json[0]['start_timestamp'], released_at.timestamp())
+                    self.assertEqual(entry, original)
+
+    def test_scheduled_streams_sort_by_time_and_move_to_the_top_when_recording(self):
+        queued_at = datetime.now()
+        released_at = datetime(2026, 7, 1, 18, tzinfo=timezone.utc).timestamp()
+        for video_id, status, release in (
+                ('laterstream', 'Waiting for scheduled time', released_at + 7200),
+                ('unknownplan', 'Waiting', None),
+                ('earlierplan', 'Waiting', released_at + 3600),
+                ('livestream1', 'Recording', released_at)):
+            self.web.active_downloads[video_id] = {
+                'downloader': SimpleNamespace(
+                    info_dict={'title': video_id, 'release_timestamp': release}, embed_info={},
+                    livestream_downloader=SimpleNamespace(stats={'status': status})),
+                'type': 'stream', 'start_time': queued_at,
+            }
+        jobs = self.client.get('/api/active').json
+        self.assertEqual([job['id'] for job in jobs],
+                         ['livestream1', 'earlierplan', 'laterstream', 'unknownplan'])
+        self.assertEqual(jobs[1]['scheduled_datetime'], '2026-07-01T19:00:00+00:00')
+        response = self.client.get('/data/active')
+        self.assertIn(b'Scheduled for', response.data)
+        self.assertIn(b'datetime="2026-07-01T19:00:00+00:00"', response.data)
+        self.assertNotIn(b'data-started=', response.data)
+
+        downloader = self.web.active_downloads['earlierplan']['downloader']
+        downloader.livestream_downloader.stats['status'] = 'Recording'
+        downloader.info_dict['release_timestamp'] = released_at + 3660
+        jobs = self.client.get('/api/active').json
+        self.assertEqual([job['id'] for job in jobs],
+                         ['earlierplan', 'livestream1', 'laterstream', 'unknownplan'])
+        self.assertIsNone(jobs[0]['scheduled_datetime'])
+        self.assertEqual(jobs[0]['start_datetime'], '2026-07-01T19:01:00+00:00')
+
+    def test_history_dates_keep_utc_storage_and_expose_iso_times_for_display(self):
+        self.web.save_to_history('abcdefghijk', {'status': 'Finished'})
+        with closing(sqlite3.connect(self.web.DB_FILE)) as conn, conn:
+            conn.execute("UPDATE history SET timestamp = '2026-07-01 22:30:00'")
+        for route in ('/', '/activity', '/data/history', '/data/recent'):
+            with self.subTest(route=route):
+                response = self.client.get(route)
+                self.assertIn(b'<time datetime="2026-07-01T22:30:00+00:00"', response.data)
+                self.assertIn(b'22:30 UTC', response.data)
+        self.assertEqual(self.client.get('/api/history').json[0]['timestamp'], '2026-07-01 22:30:00')
+
+    def test_history_and_stream_dates_use_configured_timezone_and_dst_for_each_date(self):
+        self.web.save_to_history('abcdefghijk', {'status': 'Finished'})
+        scenarios = (
+            ('Europe/Berlin', '2026-07-01 22:30:00', '2026-07-02T00:30:00+02:00', '00:30 CEST', 'Jul 2, 2026'),
+            ('Europe/Berlin', '2026-01-01 10:30:00', '2026-01-01T11:30:00+01:00', '11:30 CET', 'Jan 1, 2026'),
+            ('Europe/Berlin', '2026-03-29 00:30:00', '2026-03-29T01:30:00+01:00', '01:30 CET', 'Mar 29, 2026'),
+            ('Europe/Berlin', '2026-03-29 01:30:00', '2026-03-29T03:30:00+02:00', '03:30 CEST', 'Mar 29, 2026'),
+            ('Europe/Berlin', '2026-10-25 00:30:00', '2026-10-25T02:30:00+02:00', '02:30 CEST', 'Oct 25, 2026'),
+            ('Europe/Berlin', '2026-10-25 01:30:00', '2026-10-25T02:30:00+01:00', '02:30 CET', 'Oct 25, 2026'),
+            ('America/New_York', '2026-07-01 02:30:00', '2026-06-30T22:30:00-04:00', '22:30 EDT', 'Jun 30, 2026'),
+            ('UTC', '2026-07-01 22:30:00', '2026-07-01T22:30:00+00:00', '22:30 UTC', 'Jul 1, 2026'),
+        )
+        for zone, timestamp, expected_iso, expected_time, expected_date in scenarios:
+            with self.subTest(zone=zone, timestamp=timestamp), patch.dict(os.environ, {'TZ': zone}):
+                with closing(sqlite3.connect(self.web.DB_FILE)) as conn, conn:
+                    conn.execute('UPDATE history SET timestamp = ?', (timestamp,))
+                self.web.cache.clear()
+                released_at = datetime.fromisoformat(timestamp).replace(tzinfo=timezone.utc)
+                for video_id, status in (('livestream1', 'Recording'), ('earlierplan', 'Waiting')):
+                    self.web.active_downloads[video_id] = {
+                        'downloader': SimpleNamespace(
+                            info_dict={'release_timestamp': released_at.timestamp()}, embed_info={},
+                            livestream_downloader=SimpleNamespace(stats={'status': status})),
+                        'type': 'stream', 'start_time': datetime.now(timezone.utc),
+                    }
+                for route in ('/', '/activity', '/data/history', '/data/recent', '/data/active'):
+                    response = self.client.get(route)
+                    self.assertIn(f'datetime="{expected_iso}"'.encode(), response.data)
+                    self.assertIn(f'>{expected_time}<small>{expected_date}</small>'.encode(), response.data)
+                self.assertEqual(self.client.get('/api/history').json[0]['timestamp'], timestamp)
 
     def test_remove_cleans_only_stream_temp_files_and_allows_readding(self):
         temp_root = self.path.parent / 'temp'
@@ -597,7 +700,7 @@ class WebUiTests(unittest.TestCase):
         with self.client.session_transaction() as session:
             category, message = session['_flashes'][-1]
             self.assertEqual(category, 'success')
-            self.assertIn('Checking whether abcdefghijk is live now', message)
+            self.assertEqual(message, 'Stream abcdefghijk is already added and waiting to start. Checking whether it is live now.')
 
     def test_manual_add_keeps_recording_and_removing_jobs(self):
         for removing in (False, True):

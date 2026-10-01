@@ -71,7 +71,7 @@ These variables configure the container runtime.
 | --- | --- | --- |
 | `PUID` | *None* | User ID to run the application as. Maps file permissions on the host. |
 | `PGID` | *None* | Group ID to run the application as. Maps file permissions on the host. |
-| `TZ` | *None* | Timezone for the container (e.g., `Europe/London`). |
+| `TZ` | *None* | Timezone for the container and dates shown in the Web UI (e.g., `Europe/Berlin`). |
 | `PORT` | `5000` | The port the Web UI listens on inside the container. |
 | `UMASK` | *None* | Sets the file creation mask (permissions) for downloaded files. |
 | `UPDATEYTDLP` | *None* | Update yt-dlp to the latest nightly release on startup when set to `true`. |

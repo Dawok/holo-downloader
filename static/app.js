@@ -1,19 +1,8 @@
 const csrfToken = document.querySelector('meta[name="csrf-token"]').content;
-const scheduledTimeFormatter = new Intl.DateTimeFormat(undefined, {
-    month: 'short', day: 'numeric', year: 'numeric',
-    hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
-});
 
 function hideBrokenHistoryThumbnails(root) {
     for (const image of root.querySelectorAll('[data-history-thumbnail]')) {
         if (image.complete && image.naturalWidth === 0) image.hidden = true;
-    }
-}
-
-function updateScheduledTimes(root = document) {
-    for (const time of root.querySelectorAll('[data-scheduled-start]')) {
-        const date = new Date(Number(time.dataset.scheduledStart) * 1000);
-        if (!Number.isNaN(date.valueOf())) time.textContent = `Scheduled for ${scheduledTimeFormatter.format(date)}`;
     }
 }
 
@@ -23,7 +12,6 @@ document.addEventListener('error', event => {
     }
 }, true);
 hideBrokenHistoryThumbnails(document);
-updateScheduledTimes();
 
 function filterItems(scope) {
     const query = (scope.querySelector('[data-filter-search]')?.value || '').trim().toLocaleLowerCase();
@@ -84,13 +72,11 @@ for (const container of document.querySelectorAll('[data-poll]')) {
             if (!isBusy()) {
                 container.innerHTML = html;
                 hideBrokenHistoryThumbnails(container);
-                updateScheduledTimes(container);
             }
             updateCounters(container);
             const scope = container.closest('.filter-scope');
             if (scope) filterItems(scope);
             updateTotals();
-            updateElapsed();
         } catch (error) {
         } finally {
             pending = false;
@@ -238,16 +224,7 @@ function updateTotals() {
     for (const target of document.querySelectorAll('[data-total-size]')) target.textContent = `${value === 0 ? '0' : value.toFixed(2)} ${units[unit]}`;
 }
 
-function updateElapsed() {
-    for (const target of document.querySelectorAll('[data-started]')) {
-        const seconds = Math.max(0, Math.floor(Date.now() / 1000 - Number(target.dataset.started)));
-        target.textContent = [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60].map(value => String(value).padStart(2, '0')).join(':');
-    }
-}
-
 updateTotals();
-updateElapsed();
-if (document.querySelector('[data-started]') || document.querySelector('[data-total-size]')) setInterval(updateElapsed, 1000);
 
 document.addEventListener('error', event => {
     if (event.target instanceof HTMLImageElement) event.target.hidden = true;
