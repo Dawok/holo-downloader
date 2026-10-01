@@ -22,6 +22,22 @@ The program supports standard streams, members-only content, unarchived (private
 * **Notifications**: Integrates with Discord Webhooks for status updates (Recording, Done, Error).
 * **Flexible Filtering**: Filter downloads by regex matching on video titles or descriptions.
 
+## Screenshots
+
+Full-page previews use sample recording data.
+
+### Recordings
+
+![Full recordings page showing stream progress, fragment counts, and recent history](docs/screenshots/recordings.png)
+
+### History
+
+![Full history page with archived thumbnails](docs/screenshots/history.png)
+
+### Settings
+
+![Full settings page showing channel management](docs/screenshots/settings.png)
+
 ## Docker Usage
 
 The recommended way to run this application is via Docker. You will need to create a `config.toml`, a temporary folder, a final download folder, and a `cookies.txt` file (if using Members/Unarchived features).
