@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from channel_config import channels_from_config, read_config
+from stream_auth import CookieSession
 
 
 CHANNEL_ID = 'UC' + 'a' * 22
@@ -428,6 +429,7 @@ class WebUiTests(unittest.TestCase):
                 downloader.id = info['id']
                 downloader.kill_this = threading.Event()
                 downloader.logger = logging.getLogger('recording-removal-tests')
+                downloader.cookie_session = CookieSession(None, downloader.logger)
                 downloader.info_dict = {}
                 downloader.embed_info = {}
                 downloader.temp_output_dir = None

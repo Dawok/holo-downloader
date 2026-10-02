@@ -19,6 +19,7 @@ from livestream_dl import download_Live,getUrls
 import httpx
 
 import json
+from stream_auth import CookieSession, ytdlp_cookie_options
 
 '''
 # --- Logging Initialization Helper (Define locally for modularity) ---
@@ -58,6 +59,11 @@ class VideoDownloader():
         if logger is None:
             logger = initialize_logging(config, logger_name="Downloader", video_id=self.id)
         self.logger: logging.Logger = logger
+        self.cookie_session = CookieSession(
+            config.get_cookies_file(), logger,
+            members_only=isinstance(id, dict) and bool(id.get('members_only')),
+            cancelled=self.kill_this.is_set,
+        )
         
         self.livestream_downloader = download_Live.LiveStreamDownloader(kill_all=kill_all, logger=logger, kill_this=self.kill_this)
         
@@ -95,6 +101,7 @@ class VideoDownloader():
 
         # Options retrieved using the passed config object
         options: dict = self.config.get_livestream_dl_options(info_dict=info_dict, output_template=self.outputFile)
+        self.cookie_session.observe_info(info_dict)
         self.thumbnail_output = self.livestream_downloader.output_filename(info_dict, options["output"])
 
         # Track a stream-specific folder before recording starts. Cancelled
@@ -111,9 +118,21 @@ class VideoDownloader():
         discord_notify = threading.Thread(target=discord_web.main, kwargs={"id": self.id, "status": "recording", "config": self.config, "logger": self.logger}, daemon=True)
         discord_notify.start() 
         
-        try:            
+        metadata_cookies = self.cookie_session.cookies
+
+        def record(cookies):
+            nonlocal info_dict
+            if cookies != metadata_cookies:
+                # Authentication may change the available playback URLs.
+                _, info_dict = self.download_video_info(self.id)
+            options["cookies"] = cookies
+            options["ytdlp_options"] = ytdlp_cookie_options(options.get("ytdlp_options"), cookies)
+            return self.livestream_downloader.download_segments(
+                info_dict=info_dict, resolution=options.get("resolution"), options=options)
+
+        try:
             self.livestream_downloader.stats["status"] = "Recording"
-            self.livestream_downloader.download_segments(info_dict=info_dict, resolution=options.get("resolution"), options=options)
+            self.cookie_session.run(record)
             
             if self.kill_this.is_set():
                 self.livestream_downloader.stats["status"] = "Cancelled"
@@ -176,18 +195,22 @@ class VideoDownloader():
             additional_ytdlp_options = json.loads(self.config.get_ytdlp_options() or "{}")
             additional_ytdlp_options.setdefault("socket_timeout", 30)
             additional_ytdlp_options["logger"] = self.logger
-            info_dict, live_status = getUrls.get_Video_Info(
-                id=video_url,
-                wait=False,
-                cookies=self.config.get_cookies_file(),
-                proxy=self.config.get_proxy(),
-                additional_options=additional_ytdlp_options,
-                include_dash=self.config.get_include_dash(),
-                include_m3u8=self.config.get_include_m3u8(),
-                clean_info_dict=self.config.get_clean_info_json(),
-                ignore_no_formats=True,
-                logger=self.logger,
-            )
+            def extract(cookies):
+                return getUrls.get_Video_Info(
+                    id=video_url,
+                    wait=False,
+                    cookies=cookies,
+                    proxy=self.config.get_proxy(),
+                    additional_options=ytdlp_cookie_options(additional_ytdlp_options, cookies),
+                    include_dash=self.config.get_include_dash(),
+                    include_m3u8=self.config.get_include_m3u8(),
+                    clean_info_dict=self.config.get_clean_info_json(),
+                    ignore_no_formats=True,
+                    logger=self.logger,
+                )
+
+            info_dict, live_status = self.cookie_session.run(extract)
+            self.cookie_session.observe_info(info_dict)
             if self.kill_this.is_set():
                 raise InterruptedError("Download was removed")
             self.info_dict = {
@@ -294,13 +317,15 @@ if __name__ == "__main__":
         # Create the parser
         parser = argparse.ArgumentParser(description="Process an video by ID")
         parser.add_argument('ID', type=str, help='The video ID (required)')
+        parser.add_argument('--members-only', action='store_true', help='Use cookies for a members-only stream')
 
         # Parse the arguments
         args = parser.parse_args()
 
         main_logger = initialize_logging(config=app_config, logger_name=f"{args.ID}")
 
-        downloader = VideoDownloader(id=args.ID, config=app_config, logger=main_logger)
+        video = {'id': args.ID, 'members_only': True} if args.members_only else args.ID
+        downloader = VideoDownloader(id=video, config=app_config, logger=main_logger)
         # Call main, passing the config object and the logger
         downloader.main(use_lock_file=True)
         

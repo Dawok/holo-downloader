@@ -13,6 +13,7 @@ from typing import Optional, Dict, Any
 
 # Local imports
 from getConfig import ConfigHandler
+from stream_auth import CookieSession, ytdlp_cookie_options
 from common import FileLock, setup_umask, initialize_logging, kill_all
 from livestream_dl import getUrls
 import discord_web
@@ -34,6 +35,8 @@ class UnarchivedDownloader:
         self.kill_this = kill_this or threading.Event()
         self.config = config or ConfigHandler()
         self.logger = logger or initialize_logging(config, logger_name="unarchived_downloader", video_id=id)
+        self.cookie_session = CookieSession(self.config.get_cookies_file(), self.logger,
+                                            cancelled=self.kill_this.is_set)
         self.livestream_downloader = LiveStreamDownloader(kill_all=kill_all, logger=self.logger, kill_this=self.kill_this)
         self.info_dict = {}
 
@@ -56,7 +59,8 @@ class UnarchivedDownloader:
                 json_file=json_path, 
                 output_path=chat_out_path, 
                 config=self.config, 
-                logger=self.logger
+                logger=self.logger,
+                cookie_session=self.cookie_session,
             )
             chat_dl.main(use_lock_file=False)
         except Exception as e:
@@ -78,16 +82,21 @@ class UnarchivedDownloader:
             if self.config.get_ytdlp_options():
                 additional_options = json.loads(self.config.get_ytdlp_options())
 
-            info_dict, live_status = getUrls.get_Video_Info(
-                id=video_id,
-                wait=(60, max(self.config.upcoming_video_max_wait(), 60)*2),
-                cookies=self.config.get_cookies_file(),
-                proxy=self.config.get_proxy(),
-                additional_options=additional_options,
-                include_dash=False,
-                include_m3u8=False,
-                clean_info_dict=self.config.get_clean_info_json(),
-            )
+            def extract(cookies):
+                return getUrls.get_Video_Info(
+                    id=video_id,
+                    wait=(60, max(self.config.upcoming_video_max_wait(), 60)*2),
+                    cookies=cookies,
+                    proxy=self.config.get_proxy(),
+                    additional_options=ytdlp_cookie_options(additional_options, cookies),
+                    include_dash=False,
+                    include_m3u8=False,
+                    clean_info_dict=self.config.get_clean_info_json(),
+                    logger=self.logger,
+                )
+
+            info_dict, live_status = self.cookie_session.run(extract)
+            self.cookie_session.observe_info(info_dict)
 
             if info_dict.get('live_status') in ['is_live', 'post_live']:
                 self.livestream_downloader.stats["status"] = "Monitoring"
@@ -205,6 +214,7 @@ class UnarchivedDownloader:
         """Downloads a private or post-live video using pre-fetched info."""
         with open(info_dict_file, 'r', encoding='utf-8') as file:
             info_dict = json.load(file)
+        self.cookie_session.observe_info(info_dict)
 
         video_id = info_dict.get('id', "")
         self.logger.info(f"Attempting to download video: {video_id}")
@@ -256,7 +266,12 @@ class UnarchivedDownloader:
         self.thumbnail_output = self.livestream_downloader.output_filename(info_dict, options['output'])
         try:
             self.livestream_downloader.stats["status"] = "Recording"
-            self.livestream_downloader.download_segments(info_dict=info_dict, resolution='bv+ba/best', options=options)
+            def record(cookies):
+                options['cookies'] = cookies
+                options['ytdlp_options'] = ytdlp_cookie_options({}, cookies)
+                return self.livestream_downloader.download_segments(info_dict=info_dict, resolution='bv+ba/best', options=options)
+
+            self.cookie_session.run(record)
         except Exception as e:
             self.logger.exception(e)
             self.livestream_downloader.stats["status"] = "Error"

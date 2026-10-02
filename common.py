@@ -11,6 +11,7 @@ import json
 from typing import List, Dict, Any, Optional, Union
 
 from livestream_dl.YoutubeURL import YTDLPLogger
+from stream_auth import CookieSession, ytdlp_cookie_options
 
 import signal
 
@@ -57,7 +58,7 @@ def initialize_logging(config: ConfigHandler = None, logger_name = None, force =
 
 logger = initialize_logging()
 
-def vid_executor(streams: List[str], command: str, config: ConfigHandler = None, unarchived: bool = False, frequency: str = None) -> list[str] | str:    
+def vid_executor(streams: List[str], command: str, config: ConfigHandler = None, unarchived: bool = False, frequency: str = None, members_only: bool = False) -> list[str] | str:
     if config is None:
         config = ConfigHandler()
 
@@ -79,7 +80,11 @@ def vid_executor(streams: List[str], command: str, config: ConfigHandler = None,
         for i, live in enumerate(streams):
             if kill_all.is_set():
                 break
-            cmd_args = ["python", download_script, '--', live]
+            video_id = live.get('id') if isinstance(live, dict) else live
+            cmd_args = ["python", download_script]
+            if members_only or (isinstance(live, dict) and live.get('members_only')):
+                cmd_args.append('--members-only')
+            cmd_args.extend(['--', video_id])
             logging.debug("Executing: {0}".format(' '.join(cmd_args)))
             Popen(cmd_args, start_new_session=True)
             if i < len(streams) - 1:
@@ -114,7 +119,18 @@ def titleFilter(live: Dict[str, Any], channel_id: str, config: ConfigHandler = N
         logging.exception("Filter failed")
         return None
     
-def descriptionFilter(live: Dict[str, Any], channel_id: str, config: ConfigHandler = None) -> Optional[bool]:
+def extract_info_with_cookie_fallback(url, options, config, members_only=False, passed_logger=None):
+    session = CookieSession(config.get_cookies_file(), passed_logger or logger,
+                            members_only=members_only, cancelled=kill_all.is_set)
+
+    def extract(cookies):
+        with YoutubeDL(ytdlp_cookie_options(options, cookies)) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    return session.run(extract)
+
+
+def descriptionFilter(live: Dict[str, Any], channel_id: str, config: ConfigHandler = None, members_only: bool = False) -> Optional[bool]:
     if config is None:
         config = ConfigHandler()
 
@@ -130,14 +146,13 @@ def descriptionFilter(live: Dict[str, Any], channel_id: str, config: ConfigHandl
             'sleep_interval': 1,
             'sleep_interval_requests': 1,
             'no_warnings': True,
-            'cookiefile': config.get_cookies_file(),
         }
         
-        with YoutubeDL(ydl_opts) as ydl:
-            url = "https://www.youtube.com/watch?v={0}".format(live.get('id'))
-            info = ydl.extract_info(url, download=False)
-            logging.debug(info)
-            desc = info.get('description')
+        url = "https://www.youtube.com/watch?v={0}".format(live.get('id'))
+        info = extract_info_with_cookie_fallback(url, ydl_opts, config,
+                                                members_only=members_only or live.get('availability') == 'subscriber_only')
+        logging.debug(info)
+        desc = info.get('description')
     
     try:
         if re.search(descFilter, desc):
@@ -148,13 +163,13 @@ def descriptionFilter(live: Dict[str, Any], channel_id: str, config: ConfigHandl
         return None
     
 
-def filtering(live: Dict[str, Any], channel_id: str, config: ConfigHandler = None) -> bool:
+def filtering(live: Dict[str, Any], channel_id: str, config: ConfigHandler = None, members_only: bool = False) -> bool:
     if config is None:
         config = ConfigHandler()
 
     # We pass the valid 'config' instance down so sub-functions don't need to re-instantiate it
     title = titleFilter(live, channel_id, config)
-    description = descriptionFilter(live, channel_id, config)
+    description = descriptionFilter(live, channel_id, config, members_only=members_only)
     
     if(title or description):
         return True
@@ -183,93 +198,78 @@ def getAvailability(live: Any, config: ConfigHandler = None):
 
     if live.availability is None:        
         options = {
-            "cookiefile": config.get_cookies_file(),
             "quiet": True
         }
-        with YoutubeDL(options) as ydl: 
-            try:
-                info_dict = ydl.extract_info("https://youtu.be/{0}".format(live.id), download=False)
-                live.description = info_dict.get('description', None)
-                live.availability = info_dict.get('availability', None)
-            except:
-                pass
+        try:
+            info_dict = extract_info_with_cookie_fallback("https://youtu.be/{0}".format(live.id), options, config)
+            live.description = info_dict.get('description', None)
+            live.availability = info_dict.get('availability', None)
+        except Exception:
+            pass
     return live.availability
 
 def get_upcoming_or_live_videos(channel_id: str, config: ConfigHandler = None, tab: str = None, passed_logger: logging.Logger = None) -> List[str]:
-    if config is None:
-        config = ConfigHandler()
-    
-    this_logger = passed_logger or logger 
-
+    config = config or ConfigHandler()
+    this_logger = passed_logger or logger
     ydl_opts = {
         'quiet': True,
         'extract_flat': True,
         'sleep_interval': 1,
         'sleep_interval_requests': 1,
         'no_warnings': True,
-        'cookiefile': config.get_cookies_file(),
-        "logger": YTDLPLogger(logger=this_logger),
+        'logger': YTDLPLogger(logger=this_logger),
         'playlist_items': '1:{0}'.format(config.get_ytlp_playlist_limit() or 10),
     }
-    #if config.get_ytlp_playlist_limit():
-    #    ydl_opts.update({'playlist_items': '1:{0}'.format(config.get_ytlp_playlist_limit() or 3)})
-
     try:
-        with YoutubeDL(ydl_opts) as ydl:
-            if tab == "membership":
-                if channel_id.startswith("UUMO"):
-                    url = "https://www.youtube.com/playlist?list={0}".format(channel_id)
-                elif channel_id.startswith("UC") or channel_id.startswith("UU"):
-                    url = "https://www.youtube.com/playlist?list={0}".format("UUMO" + channel_id[2:])
-                else:
-                    ydl_opts.update({'playlist_items': '1:10'})
-                    url = "https://www.youtube.com/channel/{0}/{1}".format(channel_id, tab)
-                    
-            elif tab == "streams":
-                if channel_id.startswith("UU"):
-                    url = "https://www.youtube.com/playlist?list={0}".format(channel_id)
-                elif channel_id.startswith("UC"):
-                    url = "https://www.youtube.com/playlist?list={0}".format("UU" + channel_id[2:])
-                elif channel_id.startswith("UUMO"):
-                    url = "https://www.youtube.com/playlist?list={0}".format("UU" + channel_id[4:])
-                else:
-                    ydl_opts.update({'playlist_items': '1:10'})
-                    url = "https://www.youtube.com/channel/{0}/{1}".format(channel_id, tab)
-                    
+        if tab == "membership":
+            if channel_id.startswith("UUMO"):
+                playlist_id = channel_id
+            elif channel_id.startswith(("UC", "UU")):
+                playlist_id = "UUMO" + channel_id[2:]
             else:
-                ydl_opts.update({'playlist_items': '1:10'})
-                url = "https://www.youtube.com/channel/{0}/{1}".format(channel_id, tab)
-                
-            
-            info = ydl.extract_info(url, download=False)
-            #logging.debug(json.dumps(info))
-            upcoming_or_live_videos = []
-            
-            for video in info['entries']:
+                playlist_id = None
+        elif tab == "streams":
+            if channel_id.startswith("UUMO"):
+                playlist_id = "UU" + channel_id[4:]
+            elif channel_id.startswith(("UC", "UU")):
+                playlist_id = "UU" + channel_id[2:]
+            else:
+                playlist_id = None
+        else:
+            playlist_id = None
+        if playlist_id:
+            url = "https://www.youtube.com/playlist?list={0}".format(playlist_id)
+        else:
+            ydl_opts['playlist_items'] = '1:10'
+            url = "https://www.youtube.com/channel/{0}/{1}".format(channel_id, tab)
 
-                # Fallback if video availability doesn't exist in extracted info
-                if video.get('live_status', None) is None and video.get('duration') is None:
-                    try:
-                        video = ydl.extract_info(video.get('url'), download=False)
-                    except Exception as e:
-                        logger.error("Unable to find availability information for video {0}: {1}".format(video.get('url'), str(e)))
-                        continue
+        members_only = tab == "membership"
+        info = extract_info_with_cookie_fallback(url, ydl_opts, config, members_only, this_logger)
+        upcoming_or_live_videos = []
+        for video in info['entries']:
+            if not video:
+                continue
+            # A playlist retry must not enable cookies for every public stream.
+            if video.get('live_status') is None and video.get('duration') is None:
+                try:
+                    video = extract_info_with_cookie_fallback(video.get('url'), ydl_opts, config,
+                                                              members_only, this_logger)
+                except Exception as e:
+                    this_logger.error("Unable to find availability information for video {0}: {1}".format(video.get('url'), str(e)))
+                    continue
 
-                # Config is passed explicitly here
-                passes_filter = filtering(video, video.get('channel_id') or channel_id, config)
-                is_future = withinFuture(config, video.get('release_timestamp', None))
-                
-                this_logger.debug("({1}) live_status = {0}".format(video.get('live_status'),video.get('id')))
-
-                if (video.get('live_status') == 'is_live' or video.get('live_status') == 'post_live' or (video.get('live_status') == 'is_upcoming' and is_future)) and passes_filter:                    
-                    #logging.debug(json.dumps(video))
-                    upcoming_or_live_videos.append(video.get('id'))
-
-            return list(set(upcoming_or_live_videos))
-    except Exception as e:
+            passes_filter = filtering(video, video.get('channel_id') or channel_id, config, members_only)
+            is_future = withinFuture(config, video.get('release_timestamp'))
+            this_logger.debug("({1}) live_status = {0}".format(video.get('live_status'), video.get('id')))
+            if (video.get('live_status') in ('is_live', 'post_live') or
+                    (video.get('live_status') == 'is_upcoming' and is_future)) and passes_filter:
+                upcoming_or_live_videos.append(video.get('id'))
+        return list(set(upcoming_or_live_videos))
+    except Exception:
         this_logger.exception("An unexpected error occurred when trying to fetch videos")
         raise
-    
+
+
 def combine_unarchived(ids: List[str], config: ConfigHandler = None, passed_logger: logging.Logger = None) -> List[str]:
     if config is None:
         config = ConfigHandler()

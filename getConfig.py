@@ -306,7 +306,7 @@ class ConfigHandler:
             "batch_size": 5,
             "segment_retries": 10,
             "merge": self.get_mux(),
-            "cookies": self.get_cookies_file(),
+            "cookies": self.get_cookies_file() if info_dict.get("availability") == "subscriber_only" else None,
             #"output": self.get_done_output_path(),
             "temp_folder": str(self.get_temp_folder()),
             "write_thumbnail": self.get_thumbnail(),

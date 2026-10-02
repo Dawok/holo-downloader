@@ -3,11 +3,13 @@ import logging
 from copy import deepcopy
 from pathlib import Path
 import sys
+import tempfile
 import threading
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, call, patch
 import yt_dlp
+from stream_auth import CookieSession
 
 try:
     from livestream_dl import getUrls as dependency_get_urls
@@ -55,10 +57,106 @@ class DownloadVidTests(unittest.TestCase):
             get_include_m3u8=lambda: False,
             get_clean_info_json=lambda: False,
         )
+        self.downloader.cookie_session = CookieSession(None, self.downloader.logger,
+                                                      cancelled=self.downloader.kill_this.is_set)
         self.upcoming = {'id': 'abcdefghijk', 'title': 'Upcoming stream', 'ext': 'mp4',
                          'live_status': 'is_upcoming', 'release_timestamp': 3600}
         self.live = {**self.upcoming, 'title': 'Live stream', 'live_status': 'is_live'}
         self.module.discord_web.main.reset_mock()
+
+    def configure_cookies(self, members_only=False):
+        self.downloader.config.get_cookies_file = lambda: 'example-cookies.txt'
+        self.downloader.cookie_session = CookieSession(
+            'example-cookies.txt', self.downloader.logger, members_only=members_only,
+            cancelled=self.downloader.kill_this.is_set)
+
+    def test_public_stream_starts_without_cookies_even_with_custom_cookie_options(self):
+        self.configure_cookies()
+        self.downloader.config.get_ytdlp_options = lambda: '{"cookiefile":"other-cookies.txt","cookiesfrombrowser":["firefox"],"extractor_retries":5}'
+        with patch.object(self.module.getUrls, 'get_Video_Info', return_value=(self.live, 'is_live')) as extract:
+            self.downloader.download_video_info(self.downloader.id)
+        self.assertIsNone(extract.call_args.kwargs['cookies'])
+        options = extract.call_args.kwargs['additional_options']
+        self.assertIsNone(options['cookiefile'])
+        self.assertIsNone(options['cookiesfrombrowser'])
+        self.assertEqual(options['extractor_retries'], 5)
+
+    def test_member_discovery_flag_uses_cookies_from_the_first_lookup(self):
+        with patch.object(self.module.httpx, 'get', return_value=SimpleNamespace(status_code=404)), \
+                patch.object(self.module.download_Live, 'LiveStreamDownloader', return_value=SimpleNamespace(stats={}), create=True):
+            self.downloader.config.get_cookies_file = lambda: 'example-cookies.txt'
+            member = self.module.VideoDownloader(
+                {'id': self.downloader.id, 'channel_id': 'UC' + 'a' * 22, 'members_only': True},
+                config=self.downloader.config, logger=self.downloader.logger)
+        with patch.object(self.module.getUrls, 'get_Video_Info', return_value=(self.live, 'is_live')) as extract:
+            member.download_video_info(member.id)
+        extract.assert_called_once()
+        self.assertEqual(extract.call_args.kwargs['cookies'], 'example-cookies.txt')
+
+    def test_authentication_retry_sticks_to_that_stream_across_upcoming_checks(self):
+        self.configure_cookies()
+        with patch.object(self.module.getUrls, 'get_Video_Info', side_effect=[
+                yt_dlp.utils.DownloadError("Sign in to confirm you're not a bot"),
+                (self.upcoming, 'is_upcoming'), (self.live, 'is_live')]) as extract, \
+                patch.object(self.downloader, '_wait_for_live_check'), \
+                patch.object(self.module, 'time', return_value=0):
+            self.downloader.download_video_info(self.downloader.id)
+        self.assertEqual([c.kwargs['cookies'] for c in extract.call_args_list],
+                         [None, 'example-cookies.txt', 'example-cookies.txt'])
+
+    def test_unrelated_metadata_errors_do_not_retry_with_cookies(self):
+        for error in (yt_dlp.utils.DownloadError('Video unavailable'),
+                      yt_dlp.utils.DownloadError('This video has been removed by the uploader'),
+                      yt_dlp.utils.DownloadError('HTTP Error 429: Too Many Requests'),
+                      TimeoutError('The request timed out')):
+            with self.subTest(error=error):
+                self.configure_cookies()
+                with patch.object(self.module.getUrls, 'get_Video_Info', side_effect=error) as extract:
+                    with self.assertRaises(type(error)):
+                        self.downloader.download_video_info(self.downloader.id)
+                extract.assert_called_once()
+                self.assertFalse(self.downloader.cookie_session.use_cookies)
+
+    def test_failed_cookie_retry_stops_and_preserves_the_final_error(self):
+        self.configure_cookies()
+        with patch.object(self.module.getUrls, 'get_Video_Info', side_effect=[
+                yt_dlp.utils.DownloadError('Sign in to confirm your age'),
+                yt_dlp.utils.DownloadError('Cookies have expired')]) as extract, \
+                self.assertLogs(self.downloader.logger, level='ERROR'):
+            self.downloader.main()
+        self.assertEqual(extract.call_count, 2)
+        self.assertEqual(self.downloader.livestream_downloader.stats['status'], 'Error')
+        self.assertEqual(self.downloader.livestream_downloader.stats['error_message'],
+                         'DownloadError: Cookies have expired')
+
+    def test_recording_uses_the_stream_cookie_choice_and_retries_authentication(self):
+        for members_only, needs_retry in ((False, False), (True, False), (False, True)):
+            with self.subTest(members_only=members_only, needs_retry=needs_retry):
+                self.configure_cookies(members_only)
+                self.downloader.outputFile = 'stream.mp4'
+                self.downloader.config.get_livestream_dl_options = lambda **kwargs: {
+                    'output': 'stream.mp4', 'temp_folder': 'temp', 'cookies': 'other-cookies.txt',
+                    'ytdlp_options': {'cookiefile': 'other-cookies.txt', 'cookiesfrombrowser': ('firefox',)},
+                }
+                attempts = []
+
+                def record(**kwargs):
+                    attempts.append((kwargs['options']['cookies'], kwargs['options']['ytdlp_options'].copy()))
+                    if needs_retry and len(attempts) == 1:
+                        raise yt_dlp.utils.DownloadError("Sign in to confirm you're not a bot")
+
+                self.downloader.livestream_downloader.output_filename = lambda info, template: template
+                self.downloader.livestream_downloader.download_segments = Mock(side_effect=record)
+                with patch.object(self.downloader, 'download_video_info', return_value=('stream.mp4', self.live)) as refresh:
+                    self.module.VideoDownloader.downloader(self.downloader, self.live)
+                expected = ([None, 'example-cookies.txt'] if needs_retry else
+                            ['example-cookies.txt' if members_only else None])
+                self.assertEqual([cookies for cookies, _ in attempts], expected)
+                for cookies, options in attempts:
+                    self.assertEqual(options['cookiefile'], cookies)
+                    self.assertIsNone(options['cookiesfrombrowser'])
+                self.assertEqual(refresh.call_count, int(needs_retry))
+                self.assertEqual(self.downloader.livestream_downloader.stats['status'], 'Finished')
 
     def test_upcoming_stream_keeps_waiting_across_maximum_polling_intervals(self):
         responses = [(self.upcoming, 'is_upcoming'), (self.upcoming, 'is_upcoming'), (self.live, 'is_live')]
@@ -263,6 +361,31 @@ class DownloadVidTests(unittest.TestCase):
         self.assertEqual(info['live_status'], 'is_live')
         self.assertEqual(info['formats'][0]['url'], 'https://example.com/live.mp4')
         wait.assert_called_once()
+
+    @unittest.skipIf(dependency_get_urls is None, 'livestream_dl is supplied by the Docker base image')
+    def test_dependency_authentication_errors_retry_with_cookies(self):
+        for message in ("Sign in to confirm you're not a bot", 'Join this channel to get access to members-only content',
+                        'Sign in to confirm your age'):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                cookies_path = str(Path(directory) / 'cookies.txt')
+                self.downloader.cookie_session = CookieSession(cookies_path, self.downloader.logger)
+                metadata = {**self.live, 'extractor': 'youtube', 'extractor_key': 'Youtube', 'formats': [{
+                    'format_id': '18', 'url': 'https://example.com/live.mp4',
+                    'ext': 'mp4', 'vcodec': 'h264', 'acodec': 'aac',
+                }]}
+                attempts = []
+
+                def extract(ydl, url, **kwargs):
+                    attempts.append(ydl.params.get('cookiefile'))
+                    if ydl.params.get('cookiefile') is None:
+                        raise yt_dlp.utils.DownloadError(message)
+                    return ydl.process_ie_result(deepcopy(metadata), download=False)
+
+                with patch.object(self.module, 'getUrls', dependency_get_urls), \
+                        patch.object(yt_dlp.YoutubeDL, 'extract_info', extract):
+                    _, info = self.downloader.download_video_info(self.downloader.id)
+                self.assertEqual(info['formats'][0]['url'], 'https://example.com/live.mp4')
+                self.assertEqual(attempts, [None, cookies_path])
 
     @unittest.skipIf(dependency_get_urls is None, 'livestream_dl is supplied by the Docker base image')
     def test_dependency_still_rejects_unavailable_videos(self):

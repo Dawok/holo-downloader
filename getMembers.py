@@ -43,11 +43,11 @@ def main(command: Optional[str] = None, frequency: Optional[str] = None, config:
             if queue is not None:
                 for live in lives:
                     if return_dict:
-                        queue.put({"id": live, "channel_id": channel_id})
+                        queue.put({"id": live, "channel_id": channel_id, "members_only": True})
                     else:
                         queue.put(live)
             elif return_dict:
-                lives = [{"channel_id": channel_id, "id": id} for id in lives]
+                lives = [{"channel_id": channel_id, "id": id, "members_only": True} for id in lives]
             all_lives.extend(lives)
             
         except Exception as e:
@@ -59,7 +59,7 @@ def main(command: Optional[str] = None, frequency: Optional[str] = None, config:
             # We are passing the channel ID as the target of the error.
             discord_web.main(channel_id, "membership-error", message=str(e))
         
-    return common.vid_executor(streams=all_lives, command=command, config=config, frequency=frequency)
+    return common.vid_executor(streams=all_lives, command=command, config=config, frequency=frequency, members_only=True)
 
 if __name__ == "__main__":
     try:
