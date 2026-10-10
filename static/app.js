@@ -13,23 +13,43 @@ document.addEventListener('error', event => {
 }, true);
 hideBrokenHistoryThumbnails(document);
 
+function formatBytes(bytes) {
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    let unit = 0;
+    while (bytes >= 1024 && unit < units.length - 1) { bytes /= 1024; unit++; }
+    return `${bytes.toFixed(2)} ${units[unit]}`;
+}
+
+const matchesMode = (item, mode) => mode === 'all' || (item.dataset.modes || '').split(' ').includes(mode);
+const matchesState = (item, state) => state === 'all' || (item.dataset.state || '').includes(state);
+// Filters are either a select or a group of radio chips.
+const filterChoice = (scope, name) => scope.querySelector(`input[data-filter-${name}]:checked, select[data-filter-${name}]`)?.value || 'all';
+
 function filterItems(scope) {
     const query = (scope.querySelector('[data-filter-search]')?.value || '').trim().toLocaleLowerCase();
-    const mode = scope.querySelector('[data-filter-mode]')?.value || 'all';
-    const state = scope.querySelector('[data-filter-state]')?.value || 'all';
+    const mode = filterChoice(scope, 'mode');
+    const state = filterChoice(scope, 'state');
     const items = Array.from(scope.querySelectorAll('.filter-item'));
     let shown = 0;
+    let size = 0;
     for (const item of items) {
         const matches = (item.dataset.search || '').toLocaleLowerCase().includes(query)
-            && (mode === 'all' || (item.dataset.modes || '').split(' ').includes(mode))
-            && (state === 'all' || (item.dataset.state || '').includes(state));
+            && matchesMode(item, mode) && matchesState(item, state);
         item.hidden = !matches;
         shown += Number(matches);
+        if (matches) size += Number(item.dataset.size || 0);
+    }
+    for (const chip of scope.querySelectorAll('.chip')) {
+        const input = chip.querySelector('input');
+        const matches = 'filterMode' in input.dataset ? matchesMode : matchesState;
+        chip.querySelector('[data-chip-count]').textContent = items.filter(item => matches(item, input.value)).length;
     }
     const empty = scope.querySelector('.filter-empty');
     if (empty) empty.hidden = shown > 0 || items.length === 0;
     const count = scope.querySelector('[data-filter-count]');
-    if (count) count.textContent = `${shown} of ${items.length} channels`;
+    if (count) count.textContent = `${shown} of ${items.length} ${count.dataset.filterCount}`;
+    const total = scope.querySelector('[data-filter-size]');
+    if (total) total.textContent = formatBytes(size);
 }
 
 for (const scope of document.querySelectorAll('.filter-scope')) {
@@ -41,7 +61,7 @@ for (const scope of document.querySelectorAll('.filter-scope')) {
 function updateCounters(container) {
     for (const counter of container.querySelectorAll('[data-counter]')) {
         for (const target of document.querySelectorAll(`[data-metric="${counter.dataset.counter}"]`)) {
-            target.textContent = counter.dataset.count;
+            target.textContent = target.dataset.count = counter.dataset.count;
         }
     }
 }
@@ -52,8 +72,10 @@ for (const container of document.querySelectorAll('[data-poll]')) {
     let timer;
     let pending = false;
     const interval = Number(container.dataset.interval || 15000);
-    const isBusy = () => container.contains(document.activeElement)
-        || (document.getElementById('confirm-dialog').open && pendingConfirmation && container.contains(pendingConfirmation));
+    // Slot updates only replace status text, so they never interrupt typing.
+    const slots = container.hasAttribute('data-poll-slots');
+    const isBusy = () => !slots && (container.contains(document.activeElement)
+        || (document.getElementById('confirm-dialog').open && pendingConfirmation && container.contains(pendingConfirmation)));
     const refresh = async () => {
         if (pending) return;
         clearTimeout(timer);
@@ -69,14 +91,20 @@ for (const container of document.querySelectorAll('[data-poll]')) {
             });
             if (!response.ok) throw new Error('Update unavailable');
             const html = await response.text();
-            if (!isBusy()) {
+            if (slots) {
+                const update = document.createElement('template');
+                update.innerHTML = html;
+                for (const slot of update.content.querySelectorAll('[data-slot]')) {
+                    const target = container.querySelector(`[data-slot="${slot.dataset.slot}"]`);
+                    if (target) target.innerHTML = slot.innerHTML;
+                }
+            } else if (!isBusy()) {
                 container.innerHTML = html;
                 hideBrokenHistoryThumbnails(container);
             }
             updateCounters(container);
             const scope = container.closest('.filter-scope');
             if (scope) filterItems(scope);
-            updateTotals();
         } catch (error) {
         } finally {
             pending = false;
@@ -214,17 +242,6 @@ if (copySettings) {
     });
 }
 
-
-function updateTotals() {
-    const total = Array.from(document.querySelectorAll('[data-size]')).reduce((sum, row) => sum + Number(row.dataset.size || 0), 0);
-    let value = total;
-    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-    let unit = 0;
-    while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
-    for (const target of document.querySelectorAll('[data-total-size]')) target.textContent = `${value === 0 ? '0' : value.toFixed(2)} ${units[unit]}`;
-}
-
-updateTotals();
 
 document.addEventListener('error', event => {
     if (event.target instanceof HTMLImageElement) event.target.hidden = true;

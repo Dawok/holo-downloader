@@ -125,6 +125,18 @@ def status_class(value):
         return 'info'
     return 'muted'
 
+
+@app.template_filter('countdown')
+def countdown(timestamp, due='Starting soon'):
+    minutes = round((float(timestamp) - time.time()) / 60)
+    if minutes <= 0:
+        return due
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f'in {days} d {hours} h'
+    return f'in {hours} h {minutes} min' if hours else f'in {minutes} min'
+
 # --- Database Management ---
 
 def init_db():
@@ -152,6 +164,10 @@ def init_db():
                 removed_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        conn.execute('CREATE TABLE IF NOT EXISTS totals (name TEXT PRIMARY KEY, value INTEGER NOT NULL)')
+        # History only keeps the last 50 rows, so the all-time size is tracked on its own.
+        conn.execute('''INSERT OR IGNORE INTO totals (name, value)
+                        SELECT 'captured_bytes', COALESCE(SUM(total_size), 0) FROM history''')
 
 def is_stream_removed(video_id):
     with closing(sqlite3.connect(DB_FILE)) as conn:
@@ -194,7 +210,9 @@ def save_to_history(video_id, stats, download_type="Unknown", info=None, thumbna
                    info.get('fulltitle') or info.get('title'),
                    info.get('channel') or info.get('uploader') or info.get('author_name'),
                    thumbnail, thumbnail_mime_type, stats.get('error_message')))
-        
+        c.execute('''INSERT INTO totals (name, value) VALUES ('captured_bytes', ?)
+                     ON CONFLICT(name) DO UPDATE SET value = value + excluded.value''', (download_size,))
+
         # Cleanup old history
         c.execute('''
             DELETE FROM history WHERE id NOT IN (
@@ -211,6 +229,12 @@ def get_history():
                                thumbnail IS NOT NULL AS has_thumbnail, error_message
                                FROM history ORDER BY id DESC''').fetchall()
         return rows
+
+def get_captured_bytes():
+    """Size of every recording saved to history, including rows that have since expired."""
+    with closing(sqlite3.connect(DB_FILE)) as conn:
+        row = conn.execute("SELECT value FROM totals WHERE name = 'captured_bytes'").fetchone()
+    return row[0] if row else 0
 
 # --- Config Management (Unchanged from previous update) ---
 
@@ -629,6 +653,25 @@ def get_active_unarchived_jobs_data():
             })
     return current_jobs
 
+def get_recording_summary():
+    """Counts and all-time captured size shown above the stream lists."""
+    recording = upcoming = active_bytes = 0
+    with LOCK:
+        for tracker in (active_downloads, active_unarchived_downloads):
+            for job in tracker.values():
+                if job.get('remove_requested'):
+                    continue
+                stats = job['downloader'].livestream_downloader.stats
+                status = str(stats.get('status') or '').strip().lower()
+                recording += status == 'recording'
+                upcoming += status.startswith('waiting')
+                # A finished worker has already added its size to the saved total.
+                if not job.get('worker_finished'):
+                    active_bytes += sum((stats.get(track) or {}).get('current_filesize') or 0
+                                        for track in ('video', 'audio'))
+    return {'recording': recording, 'upcoming': upcoming,
+            'captured_bytes': get_captured_bytes() + active_bytes}
+
 def elapsed_time(started):
     seconds = max(0, int(time.time() - started.timestamp()))
     hours, seconds = divmod(seconds, 3600)
@@ -663,7 +706,8 @@ def data_active():
     """Endpoint for HTMX to poll active downloads table AND signal history update."""
     current_jobs = get_active_jobs_data()
     # 1. Render the active table
-    rendered_table = render_template('active_table.html', active_downloads=current_jobs)
+    rendered_table = render_template('active_table.html', active_downloads=current_jobs,
+                                     summary=get_recording_summary())
     response = make_response(rendered_table)
     
     # 2. Check the signal list set by the background thread
@@ -724,6 +768,7 @@ def index():
                                   history=history,
                                   active_downloads=active_jobs,
                                   monitors=get_active_unarchived_jobs_data(),
+                                  summary=get_recording_summary(),
                                   channel_count=len(channels_from_config(read_config(config_file_path)[0])),
                                   ) 
 
@@ -834,7 +879,8 @@ def config_page():
 def channels_page():
     doc, config_revision = read_config(config_file_path)
     channels = channels_from_config(doc)
-    counts = {mode: sum(channel[mode] for channel in channels) for mode in CHANNEL_TABLES}
+    counts = {'all': len(channels),
+              **{mode: sum(channel[mode] for channel in channels) for mode in CHANNEL_TABLES}}
     return render_template('channels.html', channels=channels, counts=counts,
                            revision=config_revision, query=request.args.get('q', ''),
                            mode=request.args.get('mode', 'all'))
@@ -907,7 +953,10 @@ def resolve_channel():
 
 @app.route('/activity')
 def activity_page():
-    return render_template('activity.html', history=get_history())
+    history = get_history()
+    counts = {state: sum(state in (row['status'] or '').lower() for row in history)
+              for state in ('finished', 'error', 'cancelled')}
+    return render_template('activity.html', history=history, counts={'all': len(history), **counts})
 
 
 @app.route('/schedules', methods=['GET', 'POST'])
@@ -1020,10 +1069,12 @@ def get_scheduler_jobs():
         job_obj: Job = active_jobs.get(job_id)
         
         if job_obj:
-            next_run = job_obj.next_run_time.strftime('%H:%M:%S (%d-%b)') if job_obj.next_run_time else "Paused"
+            next_run_time = job_obj.next_run_time
+            next_run = next_run_time.strftime('%H:%M:%S (%d-%b)') if next_run_time else "Paused"
             trigger = str(job_obj.trigger)
             status = "Scheduled"
         else:
+            next_run_time = None
             next_run = "N/A"
             trigger = "No Schedule Set"
             status = "Inactive"
@@ -1033,6 +1084,8 @@ def get_scheduler_jobs():
             'name': item["display"],
             'trigger': trigger,
             'next_run': next_run,
+            'next_run_datetime': next_run_time.isoformat() if next_run_time else None,
+            'next_run_timestamp': next_run_time.timestamp() if next_run_time else None,
             'status': status
         })
     return final_data
@@ -1077,8 +1130,7 @@ def force_run_job(job_name):
 def data_scheduler():
     """Endpoint for HTMX to poll scheduler status."""
     jobs = get_scheduler_jobs()
-    # Note: If you moved templates to files, use render_template('scheduler_table.html', ...)
-    return render_template('schedule_table.html', jobs=jobs)
+    return render_template('schedule_status.html', jobs=jobs)
 
 # --- JSON API Endpoints ---
 

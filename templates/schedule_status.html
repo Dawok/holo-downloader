@@ -1,0 +1,2 @@
+{% from 'ui.html' import badge, schedule_next with context %}
+{% for job in jobs %}<div data-slot="status-{{ job.id }}">{{ badge(job.status) }}</div><div data-slot="next-{{ job.id }}">{{ schedule_next(job) }}</div>{% endfor %}

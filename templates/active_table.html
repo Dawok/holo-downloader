@@ -1,2 +1,3 @@
 {% from 'ui.html' import stream_list with context %}
 {{ stream_list(active_downloads) }}
+{% for name, value in [('recording', summary.recording), ('upcoming', summary.upcoming), ('captured', summary.captured_bytes | convert_bytes)] %}<span hidden data-counter="{{ name }}" data-count="{{ value }}"></span>{% endfor %}

@@ -1,14 +1,21 @@
 {% extends 'base.html' %}
-{% from 'ui.html' import csrf, settings_nav with context %}
+{% from 'ui.html' import badge, csrf, schedule_next, settings_nav with context %}
 {% block title %}Schedules{% endblock %}
 {% block content %}
-<header class="page-heading"><div><h1>Settings</h1><p>Manage what the archiver saves and when channels are checked.</p></div></header>
-<div class="settings-layout">{{ settings_nav('schedules') }}<div class="settings-pane">
-<div class="pane-heading"><div><h2 class="pane-title">Check schedules</h2><p class="muted">Run checks now or change how often they happen.</p></div></div>
-<section class="panel"><div data-poll="{{ url_for('data_scheduler') }}" data-interval="60000">{% include 'schedule_table.html' %}</div></section>
+{% set checkers = [('streams', 'Public streams'), ('unarchived', 'Unarchived recovery'), ('members_only', 'Members-only streams'), ('community_posts', 'Community posts')] %}
+<header class="page-heading"><div><h1>Settings</h1></div></header>
+{{ settings_nav('schedules') }}
+<div class="settings-pane narrow">
+<div class="pane-heading"><div><h2 class="pane-title">Check schedules</h2><p class="muted">Five-field cron expressions. Leave a field empty to turn off automatic checks.</p></div></div>
 {% if error %}<div class="notice notice-danger" role="alert">{{ error }} <a href="{{ url_for('schedules_page') }}">Reload saved schedules</a></div>{% endif %}
-<form method="post" class="schedule-editor">{{ csrf() }}<input type="hidden" name="revision" value="{{ revision }}"><section class="form-section"><h3>Check frequency</h3><p class="section-description">Five-field cron expressions. Leave a field empty to disable automatic checks.</p>
-{% for key, label in [('streams', 'Public streams'), ('unarchived', 'Unarchived recovery'), ('members_only', 'Members-only streams'), ('community_posts', 'Community posts')] %}<div class="field-row"><div><label for="schedule-{{ key }}">{{ label }}</label></div><div><input id="schedule-{{ key }}" class="mono" name="{{ key }}" value="{{ schedules.get(key, '') }}" placeholder="Not scheduled" autocomplete="off"></div></div>{% endfor %}
-<p class="field-help cron-hint"><code>*/30 * * * *</code> every 30 minutes · <code>0 */6 * * *</code> every 6 hours</p></section><div class="form-actions"><button class="button primary">Save schedules</button></div></form>
-</div></div>
+<form method="post" data-poll="{{ url_for('data_scheduler') }}" data-poll-slots data-interval="60000">{{ csrf() }}<input type="hidden" name="revision" value="{{ revision }}">
+<div class="card">
+{% for key, label in checkers %}{% set job = jobs | selectattr('id', 'equalto', key ~ '-checker') | first %}
+<div class="schedule-row"><div><label for="schedule-{{ key }}">{{ label }}</label><div data-slot="status-{{ job.id }}">{{ badge(job.status) }}</div></div><input id="schedule-{{ key }}" class="mono" name="{{ key }}" value="{{ schedules.get(key, '') }}" placeholder="Not scheduled" autocomplete="off"><div class="schedule-next" data-slot="next-{{ job.id }}">{{ schedule_next(job) }}</div><button class="button secondary small-button" form="run-{{ key }}" aria-label="Run the {{ label | lower }} check now">Run now</button></div>
+{% endfor %}
+</div>
+<p class="field-help cron-hint"><code>*/30 * * * *</code> every 30 minutes · <code>0 */6 * * *</code> every 6 hours</p>
+<div class="form-actions"><button class="button primary">Save schedules</button></div></form>
+{% for key, label in checkers %}<form id="run-{{ key }}" action="{{ url_for('force_run_job', job_name=key ~ '-checker') }}" method="post" hidden>{{ csrf() }}</form>{% endfor %}
+</div>
 {% endblock %}

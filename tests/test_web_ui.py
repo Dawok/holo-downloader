@@ -13,6 +13,9 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+# Loaded before sys.modules is patched below, so Flask and Jinja are not dropped and re-imported mid-render.
+import flask  # noqa: F401
+
 from channel_config import channels_from_config, read_config
 from stream_auth import CookieSession
 
@@ -197,6 +200,88 @@ class WebUiTests(unittest.TestCase):
             self.web.save_to_history('bcdefghijkl', {'status': 'Finished'}, info={'title': 'Recorded title', 'channel': 'Example channel'})
             self.assertEqual(self.web.get_history()[0]['title'], 'Recorded title')
             self.assertEqual(self.client.get('/data/history').status_code, 200)
+
+    def test_captured_total_outlives_trimmed_history_and_counts_running_jobs(self):
+        for _ in range(51):
+            self.web.save_to_history('abcdefghijk', {'status': 'Finished', 'video': {'current_filesize': 1000},
+                                                     'audio': {'current_filesize': 24}})
+        self.assertEqual(len(self.web.get_history()), 50)
+        self.assertEqual(self.web.get_captured_bytes(), 51 * 1024)
+        self.web.init_db()
+        self.assertEqual(self.web.get_captured_bytes(), 51 * 1024)
+
+        def job(status, size, **entry):
+            stats = {'status': status, 'video': {'current_filesize': size}, 'audio': {}}
+            return {'downloader': SimpleNamespace(info_dict={}, embed_info={},
+                                                  livestream_downloader=SimpleNamespace(stats=stats)),
+                    'type': 'stream', 'start_time': datetime.now(timezone.utc), **entry}
+        self.web.active_downloads['livestream1'] = job('Recording', 1024)
+        self.web.active_downloads['upcoming001'] = job('Waiting for stream', 0)
+        self.web.active_downloads['removed0001'] = job('Recording', 4096, remove_requested=True)
+        # Its size is already part of the saved total.
+        self.web.active_downloads['finished001'] = job('Finished', 8192, worker_finished=True)
+        self.web.active_unarchived_downloads['unarchived1'] = job('Recording', 2048)
+        self.assertEqual(self.web.get_recording_summary(),
+                         {'recording': 2, 'upcoming': 1, 'captured_bytes': 54 * 1024})
+        page = self.client.get('/').data
+        self.assertIn(b'<strong data-metric="captured">54.00 KiB</strong>', page)
+        self.assertIn(b'<strong data-metric="recording" data-count="2">2</strong>', page)
+        fragment = self.client.get('/data/active').data
+        for name, value in (('recording', '2'), ('upcoming', '1'), ('captured', '54.00 KiB')):
+            self.assertIn(f'data-counter="{name}" data-count="{value}"'.encode(), fragment)
+
+    def test_captured_total_starts_from_existing_history_and_skips_removed_streams(self):
+        legacy_db = Path(self.web.DB_FILE).with_name('legacy.db')
+        with closing(sqlite3.connect(legacy_db)) as connection, connection:
+            connection.execute('CREATE TABLE history (id INTEGER PRIMARY KEY, video_id TEXT, type TEXT, status TEXT, total_size INTEGER, timestamp TEXT)')
+            connection.execute("INSERT INTO history VALUES (1, 'abcdefghijk', 'stream', 'Finished', 1024, '2026-01-01 12:00:00')")
+            connection.execute("INSERT INTO history VALUES (2, 'bcdefghijkl', 'stream', 'Error', NULL, '2026-01-01 13:00:00')")
+        with patch.object(self.web, 'DB_FILE', str(legacy_db)):
+            self.web.init_db()
+            self.assertEqual(self.web.get_captured_bytes(), 1024)
+            self.assertEqual(self.client.get('/activity').status_code, 200)
+        self.assertEqual(self.web.get_captured_bytes(), 0)
+        downloader = SimpleNamespace(
+            info_dict={}, embed_info={}, main=Mock(), config=SimpleNamespace(get_temp_folder=lambda: str(self.path.parent)),
+            livestream_downloader=SimpleNamespace(stats={'status': 'Cancelled', 'video': {'current_filesize': 4096}}, file_names={}))
+        self.web.active_downloads['abcdefghijk'] = {'downloader': downloader, 'type': 'stream', 'remove_requested': True}
+        self.web.thread_worker('abcdefghijk', downloader)
+        self.assertEqual(self.web.get_captured_bytes(), 0)
+        self.web.active_downloads['abcdefghijk'] = {'downloader': downloader, 'type': 'stream'}
+        self.web.thread_worker('abcdefghijk', downloader)
+        self.assertEqual(self.web.get_captured_bytes(), 4096)
+
+    def test_filter_chips_show_counts_and_schedules_share_one_list(self):
+        self.add_channel()
+        for status in ('Finished', 'Finished', 'Error', 'Cancelled'):
+            self.web.save_to_history('abcdefghijk', {'status': status, 'video': {'current_filesize': 1024}})
+        page = self.client.get('/activity').data
+        for value, count in (('all', 4), ('finished', 2), ('error', 1), ('cancelled', 1)):
+            self.assertIn(f'value="{value}" data-filter-state {"checked" if value == "all" else ""}><span>'.encode(), page)
+            self.assertRegex(page.decode(), rf'value="{value}" data-filter-state[^>]*>.*?data-chip-count>{count}<')
+        self.assertIn(b'<span data-filter-count="recordings">4 recordings</span>', page)
+        self.assertIn(b'<span data-filter-size>4.00 KiB</span>', page)
+        page = self.client.get('/channels?mode=members').data
+        self.assertIn(b'value="members" data-filter-mode checked>', page)
+        self.assertIn(b'<span data-filter-count="channels">1 channels</span>', page)
+
+        self.assertEqual(self.post('/schedules', streams='*/30 * * * *', revision=read_config(self.path)[1]).status_code, 302)
+        page = self.client.get('/schedules').data
+        fragment = self.client.get('/data/scheduler').data
+        for response in (page, fragment):
+            self.assertRegex(response.decode(), r'(?s)data-slot="next-streams-checker">\s*<span title="[^"]+">Next check \d\d:\d\d UTC</span><small>(in \d+ min|Due now)</small>')
+            self.assertRegex(response.decode(), r'(?s)data-slot="next-unarchived-checker">\s*No automatic checks')
+            self.assertIn(b'data-slot="status-community_posts-checker">', response)
+        self.assertIn(b'name="streams" value="*/30 * * * *"', page)
+        self.assertIn(b'<form id="run-members_only" action="/actions/force_run/members_only-checker" method="post" hidden>', page)
+        self.assertNotIn(b'<input', fragment)
+
+    def test_countdown_reads_as_minutes_hours_or_days(self):
+        with patch.object(self.web.time, 'time', return_value=1000):
+            for seconds, expected in ((-60, 'Starting soon'), (20, 'Starting soon'), (60 * 45, 'in 45 min'),
+                                      (3600 * 4 + 60 * 12, 'in 4 h 12 min'), (86400 * 2 + 3600 * 3, 'in 2 d 3 h')):
+                self.assertEqual(self.web.countdown(1000 + seconds), expected)
+            self.assertEqual(self.web.countdown(1000, 'Due now'), 'Due now')
 
     def test_recording_rows_escape_titles_and_remove_hides_stream(self):
         downloader = SimpleNamespace(info_dict={'title': '<script>alert(1)</script>', 'channel': 'Example channel'}, embed_info={},

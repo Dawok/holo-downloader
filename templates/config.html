@@ -2,10 +2,11 @@
 {% from 'ui.html' import csrf, settings_nav with context %}
 {% block title %}Configuration{% endblock %}
 {% block content %}
-<header class="page-heading"><div><h1>Settings</h1><p>Manage channels and what the archiver saves.</p></div></header>
-<div class="settings-layout">{{ settings_nav('config') }}<div class="settings-pane">
+<header class="page-heading"><div><h1>Settings</h1></div></header>
+{{ settings_nav('config') }}
+<div class="settings-pane narrow">
 <div class="pane-heading"><div><h2 class="pane-title">Configuration file</h2><p class="muted">Edit all download options and integrations in config.toml.</p></div></div>
 {% if error %}<div class="notice notice-danger" role="alert">Configuration not saved: {{ error }} <a href="{{ url_for('config_page') }}">Reload saved configuration</a></div>{% endif %}
-<form method="post" class="config-editor">{{ csrf() }}<input type="hidden" name="revision" value="{{ revision }}"><label class="sr-only" for="toml-editor">Configuration file</label><textarea id="toml-editor" name="toml_content" class="mono" spellcheck="false" autocapitalize="off" autocomplete="off" aria-describedby="config-help" required>{{ config_content }}</textarea><div class="config-footer"><p id="config-help" class="field-help">Saving reloads the scheduler. Invalid TOML won’t replace the saved file.</p><button class="button primary">Save configuration</button></div></form>
-</div></div>
+<form method="post" class="config-editor">{{ csrf() }}<input type="hidden" name="revision" value="{{ revision }}"><label class="sr-only" for="toml-editor">Configuration file</label><textarea id="toml-editor" name="toml_content" class="mono" spellcheck="false" autocapitalize="off" autocomplete="off" aria-describedby="config-help" required>{{ config_content }}</textarea><div class="form-actions"><p id="config-help" class="field-help push-left">Saving reloads the scheduler. Invalid TOML won’t replace the saved file.</p><button class="button primary">Save configuration</button></div></form>
+</div>
 {% endblock %}
