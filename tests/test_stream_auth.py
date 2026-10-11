@@ -126,6 +126,27 @@ class DiscoveryCookieTests(unittest.TestCase):
                     self.assertEqual(self.common.get_upcoming_or_live_videos('UC' + 'a' * 22, self.config, tab), ['abcdefghijk'])
                 self.assertEqual(factory.call_args.args[0]['cookiefile'], expected)
 
+    def test_discovery_and_video_lookup_keep_configured_po_token_options(self):
+        provider = {'youtubepot-bgutilhttp': {'base_url': ['http://token-provider:4416']}}
+        self.config.download_options['ytdlp_options'] = json.dumps({
+            'extractor_args': provider, 'cookiefile': 'other-cookies.txt',
+            'cookiesfrombrowser': ['firefox'],
+        })
+        video = {'id': 'abcdefghijk', 'url': 'https://example.com/video', 'title': 'Live'}
+        for tab, cookies in (('membership', 'example-cookies.txt'), ('streams', None)):
+            with self.subTest(tab=tab):
+                factory = self.extraction([{'entries': [video]}, {**video, 'live_status': 'is_live'}])
+                with patch.object(self.common, 'YoutubeDL', factory):
+                    self.assertEqual(self.common.get_upcoming_or_live_videos(
+                        'UC' + 'a' * 22, self.config, tab), ['abcdefghijk'])
+                self.assertEqual(factory.call_count, 2)
+                for call in factory.call_args_list:
+                    options = call.args[0]
+                    self.assertEqual(options['extractor_args'], provider)
+                    self.assertEqual(options['cookiefile'], cookies)
+                    self.assertIsNone(options['cookiesfrombrowser'])
+                    self.assertTrue(options['extract_flat'])
+
     def test_public_playlist_authentication_fallback_does_not_affect_individual_streams(self):
         video = {'id': 'abcdefghijk', 'url': 'https://example.com/video', 'title': 'Live'}
         factory = self.extraction([

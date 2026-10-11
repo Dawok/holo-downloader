@@ -61,7 +61,8 @@ class DownloadVidTests(unittest.TestCase):
                                                       cancelled=self.downloader.kill_this.is_set)
         self.upcoming = {'id': 'abcdefghijk', 'title': 'Upcoming stream', 'ext': 'mp4',
                          'live_status': 'is_upcoming', 'release_timestamp': 3600}
-        self.live = {**self.upcoming, 'title': 'Live stream', 'live_status': 'is_live'}
+        self.live = {**self.upcoming, 'title': 'Live stream', 'live_status': 'is_live',
+                     'formats': [{'format_id': '18', 'url': 'https://example.com/live.mp4'}]}
         self.module.discord_web.main.reset_mock()
 
     def configure_cookies(self, members_only=False):
@@ -103,6 +104,63 @@ class DownloadVidTests(unittest.TestCase):
             self.downloader.download_video_info(self.downloader.id)
         self.assertEqual([c.kwargs['cookies'] for c in extract.call_args_list],
                          [None, 'example-cookies.txt', 'example-cookies.txt'])
+
+    def test_live_metadata_without_formats_exposes_membership_error_for_cookie_retry(self):
+        self.configure_cookies()
+        self.downloader.config.get_ytdlp_options = lambda: '{"ignore_no_formats_error":true}'
+        attempts = []
+
+        def extract(**kwargs):
+            attempts.append((kwargs['cookies'], kwargs['ignore_no_formats'],
+                             kwargs['additional_options'].get('ignore_no_formats_error')))
+            if kwargs['cookies']:
+                return self.live, 'is_live'
+            if kwargs['ignore_no_formats']:
+                return {**self.live, 'formats': []}, 'is_live'
+            raise yt_dlp.utils.DownloadError('Join this channel to get access to members-only content')
+
+        with patch.object(self.module.getUrls, 'get_Video_Info', side_effect=extract):
+            _, info = self.downloader.download_video_info(self.downloader.id)
+        self.assertEqual(info['formats'], self.live['formats'])
+        self.assertEqual(attempts, [(None, True, True), (None, False, False),
+                                    ('example-cookies.txt', True, True)])
+
+    def test_upcoming_metadata_without_formats_keeps_waiting_without_cookie_retry(self):
+        self.configure_cookies()
+        upcoming = {**self.upcoming, 'formats': []}
+        with patch.object(self.module.getUrls, 'get_Video_Info',
+                          side_effect=[(upcoming, 'is_upcoming'), (self.live, 'is_live')]) as extract, \
+                patch.object(self.downloader, '_wait_for_live_check') as wait, \
+                patch.object(self.module, 'time', return_value=0):
+            self.downloader.download_video_info(self.downloader.id)
+        self.assertEqual(extract.call_count, 2)
+        self.assertTrue(all(call.kwargs['cookies'] is None for call in extract.call_args_list))
+        wait.assert_called_once()
+
+    def test_unrelated_missing_formats_do_not_enable_cookies(self):
+        self.configure_cookies()
+        with patch.object(self.module.getUrls, 'get_Video_Info', side_effect=[
+                ({**self.live, 'formats': []}, 'is_live'),
+                yt_dlp.utils.DownloadError('No video formats found!')]) as extract:
+            with self.assertRaisesRegex(yt_dlp.utils.DownloadError, 'No video formats found'):
+                self.downloader.download_video_info(self.downloader.id)
+        self.assertEqual(extract.call_count, 2)
+        self.assertTrue(all(call.kwargs['cookies'] is None for call in extract.call_args_list))
+
+    def test_authenticated_missing_formats_preserve_the_original_error_without_retry_loop(self):
+        self.configure_cookies(members_only=True)
+        with patch.object(self.module.getUrls, 'get_Video_Info', side_effect=[
+                ({**self.live, 'formats': []}, 'is_live'),
+                yt_dlp.utils.DownloadError('The page needs to be reloaded.')]) as extract, \
+                self.assertLogs(self.downloader.logger, level='ERROR'):
+            self.downloader.main()
+        self.assertEqual(extract.call_count, 2)
+        self.assertTrue(all(call.kwargs['cookies'] == 'example-cookies.txt'
+                            for call in extract.call_args_list))
+        self.assertEqual(self.downloader.livestream_downloader.stats['status'], 'Error')
+        self.assertIn('The page needs to be reloaded.',
+                      self.downloader.livestream_downloader.stats['error_message'])
+        self.downloader.downloader.assert_not_called()
 
     def test_unrelated_metadata_errors_do_not_retry_with_cookies(self):
         for error in (yt_dlp.utils.DownloadError('Video unavailable'),
@@ -361,6 +419,36 @@ class DownloadVidTests(unittest.TestCase):
         self.assertEqual(info['live_status'], 'is_live')
         self.assertEqual(info['formats'][0]['url'], 'https://example.com/live.mp4')
         wait.assert_called_once()
+
+    @unittest.skipIf(dependency_get_urls is None, 'livestream_dl is supplied by the Docker base image')
+    def test_dependency_retries_membership_warning_hidden_by_ignore_no_formats(self):
+        from yt_dlp.extractor.youtube import YoutubeIE
+
+        with tempfile.TemporaryDirectory() as directory:
+            cookies_path = str(Path(directory) / 'cookies.txt')
+            self.downloader.cookie_session = CookieSession(cookies_path, self.downloader.logger)
+            metadata = {**self.live, 'extractor': 'youtube', 'extractor_key': 'Youtube', 'formats': [{
+                'format_id': '18', 'url': 'https://example.com/live.mp4',
+                'ext': 'mp4', 'vcodec': 'h264', 'acodec': 'aac',
+            }]}
+            attempts = []
+
+            def extract(ydl, url, **kwargs):
+                attempts.append((ydl.params['cookiefile'], ydl.params['ignore_no_formats_error']))
+                info = deepcopy(metadata)
+                if ydl.params['cookiefile'] is None:
+                    info['formats'] = []
+                    info['availability'] = 'subscriber_only'
+                    YoutubeIE(ydl).raise_no_formats(
+                        'Join this channel to get access to members-only content', expected=True)
+                return ydl.process_ie_result(info, download=False)
+
+            with patch.object(self.module, 'getUrls', dependency_get_urls), \
+                    patch.object(yt_dlp.YoutubeDL, 'extract_info', extract), \
+                    self.assertLogs(self.downloader.logger, level='WARNING'):
+                _, info = self.downloader.download_video_info(self.downloader.id)
+            self.assertEqual(info['formats'][0]['url'], 'https://example.com/live.mp4')
+            self.assertEqual(attempts, [(None, True), (None, False), (cookies_path, True)])
 
     @unittest.skipIf(dependency_get_urls is None, 'livestream_dl is supplied by the Docker base image')
     def test_dependency_authentication_errors_retry_with_cookies(self):

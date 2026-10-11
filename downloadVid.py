@@ -196,7 +196,7 @@ class VideoDownloader():
             additional_ytdlp_options.setdefault("socket_timeout", 30)
             additional_ytdlp_options["logger"] = self.logger
             def extract(cookies):
-                return getUrls.get_Video_Info(
+                extraction_options = dict(
                     id=video_url,
                     wait=False,
                     cookies=cookies,
@@ -208,6 +208,15 @@ class VideoDownloader():
                     ignore_no_formats=True,
                     logger=self.logger,
                 )
+                info, status = getUrls.get_Video_Info(**extraction_options)
+                if status != 'is_upcoming' and not (info.get('formats') or info.get('url')):
+                    # Upcoming streams legitimately have no formats. For live
+                    # streams, repeat with strict extraction so yt-dlp exposes
+                    # the original authentication error to the cookie retry.
+                    extraction_options['ignore_no_formats'] = False
+                    extraction_options['additional_options']['ignore_no_formats_error'] = False
+                    info, status = getUrls.get_Video_Info(**extraction_options)
+                return info, status
 
             info_dict, live_status = self.cookie_session.run(extract)
             self.cookie_session.observe_info(info_dict)

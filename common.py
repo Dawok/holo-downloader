@@ -122,6 +122,7 @@ def titleFilter(live: Dict[str, Any], channel_id: str, config: ConfigHandler = N
 def extract_info_with_cookie_fallback(url, options, config, members_only=False, passed_logger=None):
     session = CookieSession(config.get_cookies_file(), passed_logger or logger,
                             members_only=members_only, cancelled=kill_all.is_set)
+    options = {**json.loads(config.get_ytdlp_options() or '{}'), **options}
 
     def extract(cookies):
         with YoutubeDL(ytdlp_cookie_options(options, cookies)) as ydl:
