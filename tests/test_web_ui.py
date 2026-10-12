@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 
 # Loaded before sys.modules is patched below, so Flask and Jinja are not dropped and re-imported mid-render.
 import flask  # noqa: F401
+from apscheduler.triggers.date import DateTrigger  # noqa: F401 — keep trigger class identity across sys.modules patches
 
 from channel_config import channels_from_config, read_config
 from stream_auth import CookieSession
@@ -63,6 +64,8 @@ class WebUiTests(unittest.TestCase):
         self.web.init_db()
         self.web.cache.clear()
         self.web.scheduler.remove_all_jobs()
+        with self.web.CHECKER_LOCK:
+            self.web.checker_runs.clear()
         self.web.active_downloads.clear()
         self.web.active_unarchived_downloads.clear()
         self.client = self.web.app.test_client()
@@ -153,6 +156,133 @@ class WebUiTests(unittest.TestCase):
         with patch.object(self.web, 'update_scheduler', return_value=(True, 'Updated')):
             self.assertEqual(self.post('/config', toml_content=before.decode() + '\nextra = true\n', revision=revision).status_code, 302)
         self.assertEqual(self.post('/config', toml_content=before.decode(), revision=revision).status_code, 400)
+
+    def test_enabled_checker_runs_on_startup_and_keeps_its_cron_schedule(self):
+        self.path.write_text('[cron_schedule]\nstreams = "0 0 1 1 *"\n')
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def scan():
+            started.set()
+            release.wait(3)
+
+        def completed(event):
+            if event.job_id == 'streams-checker':
+                finished.set()
+
+        from apscheduler.events import EVENT_JOB_EXECUTED
+        self.web.scheduler.add_listener(completed, EVENT_JOB_EXECUTED)
+        try:
+            with patch.object(self.web, 'get_streams', side_effect=scan) as scan_mock:
+                self.web.update_scheduler(run_on_startup=True)
+                self.assertTrue(started.wait(2))
+                self.assertEqual(self.web.get_scheduler_jobs()[0]['status'], 'Running')
+                self.assertEqual([job.id for job in self.web.scheduler.get_jobs()], ['streams-checker'])
+                self.assertFalse(self.web.request_checker_run('streams'))
+                release.set()
+                self.assertTrue(finished.wait(2))
+                scan_mock.assert_called_once()
+            job = self.web.scheduler.get_job('streams-checker')
+            self.assertGreater(job.next_run_time, datetime.now(timezone.utc))
+            self.assertEqual(self.web.get_scheduler_jobs()[0]['status'], 'Scheduled')
+        finally:
+            release.set()
+            finished.wait(3)
+            self.web.scheduler.remove_listener(completed)
+
+    def test_saving_schedules_waits_for_cron_instead_of_starting_an_extra_scan(self):
+        self.path.write_text('[cron_schedule]\nstreams = "0 0 1 1 *"\n')
+        with patch.object(self.web, 'get_streams') as scan:
+            self.web.update_scheduler()
+            self.assertGreater(self.web.scheduler.get_job('streams-checker').next_run_time,
+                               datetime.now(timezone.utc))
+            scan.assert_not_called()
+
+    def test_manual_routes_share_queued_guard_even_without_a_schedule(self):
+        self.web.scheduler.pause()
+        try:
+            self.assertEqual(self.post('/actions/check').status_code, 302)
+            self.assertEqual(self.web.get_scheduler_jobs()[0]['status'], 'Queued')
+            self.assertEqual(self.post('/actions/force_run/streams-checker').status_code, 302)
+            self.assertEqual(len(self.web.scheduler.get_jobs()), 1)
+            self.assertIn(b'Queued', self.client.get('/data/scheduler').data)
+        finally:
+            self.web.scheduler.remove_all_jobs()
+            self.web.scheduler.resume()
+
+    def test_manual_checker_remains_running_after_one_off_job_is_removed(self):
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def scan():
+            started.set()
+            release.wait(3)
+
+        from apscheduler.events import EVENT_JOB_EXECUTED
+        def completed(event):
+            if event.job_id.startswith('manual-streams-checker-'):
+                finished.set()
+
+        self.web.scheduler.add_listener(completed, EVENT_JOB_EXECUTED)
+        try:
+            with patch.object(self.web, 'get_streams', side_effect=scan) as scan_mock:
+                self.assertEqual(self.post('/actions/force_run/streams-checker').status_code, 302)
+                self.assertTrue(started.wait(2))
+                self.assertIsNone(self.web.scheduler.get_job('streams-checker'))
+                self.assertEqual(self.web.scheduler.get_jobs(), [])
+                self.assertEqual(self.web.get_scheduler_jobs()[0]['status'], 'Running')
+                self.assertEqual(self.post('/actions/check').status_code, 302)
+                self.assertEqual(self.post('/actions/force_run/streams-checker').status_code, 302)
+                self.assertFalse(self.web.run_checker('streams'))
+                self.assertIn(b'Running', self.client.get('/data/scheduler').data)
+                release.set()
+                self.assertTrue(finished.wait(2))
+                scan_mock.assert_called_once()
+                self.assertEqual(self.web.get_scheduler_jobs()[0]['status'], 'Inactive')
+        finally:
+            release.set()
+            finished.wait(3)
+            self.web.scheduler.remove_listener(completed)
+
+    def test_discovery_failure_reaches_checker_status_and_can_be_retried(self):
+        def discover(**kwargs):
+            raise RuntimeError('Discovery service unavailable')
+
+        def scan():
+            self.web.get_videos_with_queue(discover, Mock())
+
+        with patch.object(self.web, 'get_streams', side_effect=scan), \
+                self.assertLogs(self.web.common.logger, level='ERROR'):
+            with self.assertRaisesRegex(RuntimeError, 'Discovery service unavailable'):
+                self.web.run_checker('streams')
+        job = self.client.get('/api/scheduler').get_json()[0]
+        self.assertEqual(job['status'], 'Failed')
+        self.assertIn('Discovery service unavailable', job['last_error'])
+        self.assertIsNotNone(job['last_finished_datetime'])
+        with patch.object(self.web, 'get_streams') as scan:
+            self.assertTrue(self.web.run_checker('streams'))
+            scan.assert_called_once()
+        self.assertEqual(self.web.get_scheduler_jobs()[0]['status'], 'Inactive')
+
+    def test_one_bad_download_does_not_abandon_other_discovered_streams(self):
+        def discover(queue):
+            queue.put('abcdefghijk')
+            queue.put('lmnopqrstuv')
+
+        download = Mock(side_effect=[ValueError('Invalid stream'), True])
+        with patch.object(self.web.time, 'sleep'), \
+                self.assertLogs(self.web.common.logger, level='ERROR'):
+            self.web.get_videos_with_queue(discover, download)
+        self.assertEqual([call.args[0] for call in download.call_args_list],
+                         ['abcdefghijk', 'lmnopqrstuv'])
+
+    def test_failed_manual_submission_releases_the_checker_guard(self):
+        with patch.object(self.web.scheduler, 'add_job', side_effect=RuntimeError('Scheduler unavailable')):
+            with self.assertRaises(RuntimeError):
+                self.web.request_checker_run('streams')
+        self.assertNotIn('streams', self.web.checker_runs)
 
     def test_schedules_validate_all_fields_before_saving(self):
         before = self.path.read_bytes()

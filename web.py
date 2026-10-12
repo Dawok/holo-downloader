@@ -51,6 +51,8 @@ THUMBNAIL_MIME_TYPES = {
 LOCK = threading.Lock()
 
 scheduler = BackgroundScheduler(daemon=True)
+CHECKER_LOCK = threading.Lock()
+checker_runs = {}
 
 # Global State for Active Downloads
 active_downloads = {}
@@ -117,9 +119,9 @@ def status_class(value):
     status = str(value or '').lower()
     if 'error' in status or 'failed' in status:
         return 'danger'
-    if 'warning' in status or 'waiting' in status:
+    if 'warning' in status or 'waiting' in status or status == 'queued':
         return 'warning'
-    if status in {'finished', 'recording', 'scheduled'}:
+    if status in {'finished', 'recording', 'scheduled', 'running'}:
         return 'success'
     if status in {'monitoring', 'get chat', 'muxing', 'moving'}:
         return 'info'
@@ -492,14 +494,16 @@ def get_videos_with_queue(discovery_func, download_func, *args, **kwargs):
     Helper to run discovery in a thread and process items from a queue.
     """
     stream_queue = queue.Queue()
-    common.logger.info("Running scheduled stream check...")
+    discovery_errors = []
 
-    # 1. Start discovery in a background thread
-    # Note: discovery_func (like getVids.main) must be updated to accept 'q'
+    def discover():
+        try:
+            discovery_func(*args, queue=stream_queue, **kwargs)
+        except Exception as error:
+            discovery_errors.append(error)
+
     discovery_thread = threading.Thread(
-        target=discovery_func, 
-        args=args, 
-        kwargs={'queue': stream_queue, **kwargs},
+        target=discover,
         daemon=True
     )
     discovery_thread.start()
@@ -510,9 +514,12 @@ def get_videos_with_queue(discovery_func, download_func, *args, **kwargs):
             # Wait for an item (timeout ensures we check if thread is still alive)
             stream = stream_queue.get(timeout=1)
             
-            download_func(stream)            
-            
-            stream_queue.task_done()
+            try:
+                download_func(stream)
+            except Exception:
+                common.logger.exception("Could not start discovered stream %s", stream)
+            finally:
+                stream_queue.task_done()
 
             # Spread out download starts
             time.sleep(random.uniform(5.0, 10.0))
@@ -520,6 +527,9 @@ def get_videos_with_queue(discovery_func, download_func, *args, **kwargs):
             # If queue is empty and discovery is done, we are finished
             if not discovery_thread.is_alive():
                 break
+    discovery_thread.join()
+    if discovery_errors:
+        raise discovery_errors[0]
 
 def get_streams():
     get_videos_with_queue(getVids.main, start_download, unarchived=False, return_dict=True, config=load_config())
@@ -534,10 +544,71 @@ def get_community_tab():
     common.logger.info("Running scheduled stream check...")
     communityPosts.main(config=load_config())
 
-def update_scheduler():
+def checker_functions():
+    return {
+        'streams': get_streams,
+        'unarchived': get_unarchived,
+        'members_only': get_members,
+        'community_posts': get_community_tab,
+    }
+
+
+def run_checker(name, reserved=False):
+    """Share one execution guard across automatic and manual checker runs."""
+    with CHECKER_LOCK:
+        status = checker_runs.get(name, {}).get('status')
+        if reserved:
+            if status != 'Queued':
+                return False
+        elif status in ('Queued', 'Running'):
+            common.logger.info("Skipping %s check: already %s", name, status.lower())
+            return False
+        checker_runs[name] = {'status': 'Running', 'started_at': datetime.now(timezone.utc),
+                              'finished_at': None, 'error': None}
+    common.logger.info("Starting %s check", name)
+    final_status = 'Finished'
+    error_message = None
+    try:
+        checker_functions()[name]()
+    except Exception as error:
+        final_status = 'Failed'
+        error_message = f'{type(error).__name__}: {error}'
+        common.logger.exception("%s check failed", name)
+        raise
+    else:
+        common.logger.info("Finished %s check", name)
+        return True
+    finally:
+        with CHECKER_LOCK:
+            checker_runs[name].update(status=final_status, error=error_message,
+                                      finished_at=datetime.now(timezone.utc))
+
+
+def request_checker_run(name):
+    with CHECKER_LOCK:
+        if checker_runs.get(name, {}).get('status') in ('Queued', 'Running'):
+            return False
+        previous = checker_runs.get(name)
+        checker_runs[name] = {'status': 'Queued', 'started_at': None,
+                              'finished_at': None, 'error': None}
+    try:
+        scheduler.add_job(run_checker, trigger='date', args=(name, True),
+                          id=f'manual-{name}-checker-{secrets.token_hex(8)}',
+                          misfire_grace_time=None)
+    except Exception:
+        with CHECKER_LOCK:
+            if previous is None:
+                checker_runs.pop(name, None)
+            else:
+                checker_runs[name] = previous
+        raise
+    return True
+
+
+def update_scheduler(run_on_startup=False):
     config = load_config()
     
-    def create_schedule(name: str, method):
+    def create_schedule(name: str):
         schedule_name = f"{name}-checker"
         if scheduler.get_job(schedule_name):
             scheduler.remove_job(schedule_name)
@@ -550,27 +621,22 @@ def update_scheduler():
             trigger = CronTrigger.from_crontab(cron_string)
             
             scheduler.add_job(
-                method, 
+                run_checker,
+                args=(name,),
                 trigger=trigger,
                 id=schedule_name,
                 max_instances=1,      # <-- Prevent overlapping checks
                 coalesce=True,        # <-- If missed run, run once only
-                replace_existing=True # <-- Ensure old job is overwritten
+                replace_existing=True, # <-- Ensure old job is overwritten
+                **({'next_run_time': datetime.now(timezone.utc)} if run_on_startup else {}),
             )
             return True, f"Scheduler updated with: {cron_string}"
         except ValueError as e:
             common.logger.error(f"Cron Error: {e}")
             return False, f"Invalid Cron expression: {e}"
 
-    schedules = {
-        "streams": get_streams,
-        "unarchived": get_unarchived,
-        "members_only": get_members,
-        "community_posts": get_community_tab,
-    }
-
-    for schedule_type, method in schedules.items():
-        created, message = create_schedule(name=schedule_type, method=method)
+    for schedule_type in checker_functions():
+        created, message = create_schedule(name=schedule_type)
         if created is False:
             common.logger.debug("Error creating schedule for {0}: {1}".format(schedule_type, message))
     return True, "All valid schedules loaded"
@@ -774,32 +840,10 @@ def index():
 
 @app.route('/actions/check', methods=['POST'])
 def manual_check():
-    """Triggers an existing job's function to run immediately."""
-
-    manual_check_id = "manual-stream-check"
-
-    # 1. Get the existing job object
-    job = scheduler.get_job(manual_check_id)
-
-    if job:
-        common.logger.warning("Manual stream check already running")
-        flash("Manual stream check already triggered, please wait for existing check to finish", "warning")
-        return redirect(url_for('index'))
-
-    # 2. Schedule a new one-off job with the same function/parameters
-    scheduler.add_job(
-        get_streams, 
-        trigger='date',
-        run_date=datetime.now(),
-        id=manual_check_id,
-        max_instances=1,
-        coalesce=True,
-        replace_existing=True
-        # Copying job stores, executor, etc. is often unnecessary
-        # but you might want to specify executor if you need a different one.
-    )
-    common.logger.debug(f"Successfully triggered immediate run for job ID: {manual_check_id}")
-    flash("Manual check triggered! Tables will update shortly.", "success")
+    if request_checker_run('streams'):
+        flash("Stream check queued. Tables will update as streams are found.", "success")
+    else:
+        flash("Stream check is already queued or running.", "warning")
     return redirect(url_for('index'))
 
 
@@ -1062,6 +1106,8 @@ def get_scheduler_jobs():
         {"id": "community_posts-checker", "display": "Community Tab Checker"},
     ]
     active_jobs = {job.id: job for job in scheduler.get_jobs()}
+    with CHECKER_LOCK:
+        runs = {name: dict(run) for name, run in checker_runs.items()}
     final_data = []
 
     for item in possible_jobs:
@@ -1079,6 +1125,9 @@ def get_scheduler_jobs():
             trigger = "No Schedule Set"
             status = "Inactive"
             
+        run = runs.get(job_id.removesuffix('-checker'), {})
+        if run.get('status') in ('Queued', 'Running', 'Failed'):
+            status = run['status']
         final_data.append({
             'id': job_id,
             'name': item["display"],
@@ -1086,39 +1135,22 @@ def get_scheduler_jobs():
             'next_run': next_run,
             'next_run_datetime': next_run_time.isoformat() if next_run_time else None,
             'next_run_timestamp': next_run_time.timestamp() if next_run_time else None,
-            'status': status
+            'status': status,
+            'last_error': run.get('error'),
+            'last_started_datetime': run['started_at'].isoformat() if run.get('started_at') else None,
+            'last_finished_datetime': run['finished_at'].isoformat() if run.get('finished_at') else None,
         })
     return final_data
 
 @app.route('/actions/force_run/<job_name>', methods=['POST'])
 def force_run_job(job_name):
     """Executes a job function immediately in the background."""
-    # Mapping job IDs back to their functions
-    mapping = {
-        "streams-checker": get_streams,
-        "unarchived-checker": get_unarchived,
-        "members_only-checker": get_members,
-        "community_posts-checker": get_community_tab,
-    }
-    manual_check_id = f"manual-{job_name}"
-    func = mapping.get(job_name)
-    if func:
-        job = scheduler.get_job(manual_check_id)
-        if job:
-            common.logger.warning("Manual stream check already running")
-            flash("Manual stream check already triggered, please wait for existing check to finish", "warning")
-        else:    
-            # Run it immediately as a one-off job
-            scheduler.add_job(func, 
-                              trigger='date', 
-                              run_date=datetime.now(), 
-                              id=manual_check_id, name=manual_check_id, 
-                              max_instances=1,      # <-- Prevent overlapping checks
-                              coalesce=True,        # <-- If missed run, run once only
-                              replace_existing=True # <-- Ensure old job is overwritten
-                            )
-            common.logger.debug(f"Successfully triggered immediate run for job ID: {manual_check_id}")
-            flash(f"Force-run triggered for {job_name}", "info")
+    name = job_name.removesuffix('-checker')
+    if job_name == f'{name}-checker' and name in checker_functions():
+        if request_checker_run(name):
+            flash(f"Check queued for {name}.", "info")
+        else:
+            flash("Check is already queued or running.", "warning")
     else:
         flash(f"Unknown job: {job_name}", "danger")
         
@@ -1205,7 +1237,7 @@ GLOBAL_THEME = config.get_webui_theme()
 
 init_db()
 
-update_scheduler()
+update_scheduler(run_on_startup=True)
 scheduler.start()
 
 # ---------------------------------------------------------
