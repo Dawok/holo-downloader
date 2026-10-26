@@ -219,7 +219,7 @@ class UnarchivedDownloader:
         video_id = info_dict.get('id', "")
         self.logger.info(f"Attempting to download video: {video_id}")
 
-        discord_web.main(video_id, "recording", config=self.config)
+        discord_web.main(video_id, "recording", config=self.config, info=info_dict)
 
         options = {
             "ID": video_id,
@@ -278,11 +278,12 @@ class UnarchivedDownloader:
             discord_web.main(
                 video_id, "error",
                 message=str(f"{e}\n{traceback.format_exc()}")[-1000:],
-                config=self.config
+                config=self.config,
+                info=info_dict
             )
             return
 
-        discord_web.main(video_id, "done", config=self.config)
+        discord_web.main(video_id, "done", config=self.config, info=info_dict)
 
         # Clean up temp files
         if os.path.exists(info_dict_file):

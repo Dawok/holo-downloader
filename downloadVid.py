@@ -115,7 +115,7 @@ class VideoDownloader():
         
         # Start additional information downloaders (Discord notification)
         # NOTE: Assuming discord_web.main is updated to accept the config object
-        discord_notify = threading.Thread(target=discord_web.main, kwargs={"id": self.id, "status": "recording", "config": self.config, "logger": self.logger}, daemon=True)
+        discord_notify = threading.Thread(target=discord_web.main, kwargs={"id": self.id, "status": "recording", "config": self.config, "logger": self.logger, "info": info_dict}, daemon=True)
         discord_notify.start() 
         
         metadata_cookies = self.cookie_session.cookies
@@ -153,7 +153,7 @@ class VideoDownloader():
             discord_notify.join(timeout=60.0)
             
         # Final notification using the config object
-        discord_web.main(id=self.id, status="done", config=self.config)
+        discord_web.main(id=self.id, status="done", config=self.config, info=self.info_dict)
         return
 
     def request_live_check(self) -> bool:
@@ -172,11 +172,12 @@ class VideoDownloader():
                 return
         raise InterruptedError("Download was removed")
 
-    def download_video_info(self, video_url: str) -> Tuple[str, Dict[str, Any]]:
+    def download_video_info(self, video_url: str, notify_waiting: bool = False) -> Tuple[str, Dict[str, Any]]:
         """
         Fetches video metadata and prepares the output file template.
         
-        Uses the passed config and logger objects.
+        Uses the passed config and logger objects. With notify_waiting, the
+        "waiting" webhook is sent once the first lookup has the video details.
         """
         options = {
             'outtmpl': self.config.get_ytdlp(self.channel_id),
@@ -227,11 +228,19 @@ class VideoDownloader():
                 'title': info_dict.get('title'),
                 'fulltitle': info_dict.get('fulltitle'),
                 'uploader': info_dict.get('uploader'),
+                'channel': info_dict.get('channel'),
+                'channel_url': info_dict.get('channel_url'),
                 'thumbnail': info_dict.get('thumbnail'),
                 'webpage_url': info_dict.get('webpage_url'),
                 'release_timestamp': info_dict.get('release_timestamp'),
                 'live_status': info_dict.get('live_status')
             }
+            if notify_waiting:
+                notify_waiting = False
+                try:
+                    discord_web.main(self.id, "waiting", config=self.config, info=self.info_dict)
+                except Exception:
+                    self.logger.exception("Unable to send discord waiting message")
             if live_status != "is_upcoming":
                 break
             release_timestamp = info_dict.get("release_timestamp")
@@ -253,12 +262,10 @@ class VideoDownloader():
         """
         
         def run_download():
-            # Use the config object for pre-download notification
-            discord_web.main(self.id, "waiting", config=self.config)
             self.livestream_downloader.stats["status"] = "Waiting"
             try:
-                # Pass config and logger
-                self.outputFile, info_dict = self.download_video_info(self.id)
+                # Pass config and logger; the "waiting" webhook follows the first lookup
+                self.outputFile, info_dict = self.download_video_info(self.id, notify_waiting=True)
                 self.logger.debug("Output file: {0}".format(self.outputFile))
 
                 # Create distilled info_dict for web ui
@@ -267,6 +274,8 @@ class VideoDownloader():
                     'title': info_dict.get('title'),
                     'fulltitle': info_dict.get('fulltitle'),
                     'uploader': info_dict.get('uploader'),
+                    'channel': info_dict.get('channel'),
+                    'channel_url': info_dict.get('channel_url'),
                     'thumbnail': info_dict.get('thumbnail'),
                     'webpage_url': info_dict.get('webpage_url'),
                     'release_timestamp': info_dict.get('release_timestamp'),
@@ -288,7 +297,7 @@ class VideoDownloader():
                 self.livestream_downloader.stats.setdefault("error_message", f"{type(e).__name__}: {e}")
                 self.logger.exception("Error downloading video")
                 # Pass config for error notification
-                discord_web.main(self.id, "error", message=f"{type(e).__name__}: {str(e)}"[-500:], config=self.config)
+                discord_web.main(self.id, "error", message=f"{type(e).__name__}: {str(e)}"[-500:], config=self.config, info=self.info_dict)
 
         
         if use_lock_file:

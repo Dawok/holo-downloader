@@ -228,6 +228,25 @@ class DownloadVidTests(unittest.TestCase):
         wait.assert_has_calls([call(900), call(900)])
         self.assertTrue(all(arguments.kwargs['wait'] is False for arguments in extract.call_args_list))
 
+    def test_waiting_webhook_uses_the_first_lookup_and_is_sent_once(self):
+        upcoming = {**self.upcoming, 'fulltitle': 'Upcoming stream', 'channel': 'Example Ch.',
+                    'channel_url': 'https://www.youtube.com/channel/UCexample',
+                    'thumbnail': 'https://i.ytimg.com/vi/abcdefghijk/maxresdefault.jpg'}
+        responses = [(upcoming, 'is_upcoming'), (upcoming, 'is_upcoming'), (self.live, 'is_live')]
+        with patch.object(self.module.getUrls, 'get_Video_Info', side_effect=responses), \
+                patch.object(self.downloader, '_wait_for_live_check'):
+            self.downloader.download_video_info('abcdefghijk', notify_waiting=True)
+        self.module.discord_web.main.assert_called_once()
+        args, kwargs = self.module.discord_web.main.call_args
+        self.assertEqual(args, ('abcdefghijk', 'waiting'))
+        self.assertEqual(kwargs['info']['channel'], 'Example Ch.')
+        self.assertEqual(kwargs['info']['thumbnail'], upcoming['thumbnail'])
+
+    def test_metadata_refresh_does_not_send_waiting_webhook(self):
+        with patch.object(self.module.getUrls, 'get_Video_Info', return_value=(self.live, 'is_live')):
+            self.downloader.download_video_info('abcdefghijk')
+        self.module.discord_web.main.assert_not_called()
+
     def test_upcoming_polling_interval_respects_the_scheduled_start_and_bounds(self):
         for release_timestamp, expected_wait in ((30, 60), (120, 120), (3600, 900), (None, 300)):
             with self.subTest(release_timestamp=release_timestamp):
@@ -354,7 +373,10 @@ class DownloadVidTests(unittest.TestCase):
                 self.assertFalse(worker.is_alive())
             self.assertEqual(self.downloader.livestream_downloader.stats['status'], 'Cancelled')
             self.downloader.downloader.assert_not_called()
-            self.module.discord_web.main.assert_called_once_with('abcdefghijk', 'waiting', config=self.downloader.config)
+            self.module.discord_web.main.assert_called_once()
+            args, kwargs = self.module.discord_web.main.call_args
+            self.assertEqual(args, ('abcdefghijk', 'waiting'))
+            self.assertEqual(kwargs['info']['title'], 'Upcoming stream')
         finally:
             self.downloader.kill_this.set()
             worker.join(2)
